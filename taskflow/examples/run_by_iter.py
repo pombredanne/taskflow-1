@@ -30,14 +30,12 @@ sys.path.insert(0, top_dir)
 sys.path.insert(0, self_dir)
 
 
-from taskflow.engines.action_engine import engine
+from taskflow import engines
 from taskflow.patterns import linear_flow as lf
-from taskflow.persistence.backends import impl_memory
 from taskflow import task
-from taskflow.utils import persistence_utils
 
 
-# INTRO: This examples shows how to run a set of engines at the same time, each
+# INTRO: This example shows how to run a set of engines at the same time, each
 # running in different engines using a single thread of control to iterate over
 # each engine (which causes that engine to advanced to its next state during
 # each iteration).
@@ -73,18 +71,12 @@ flows = []
 for i in range(0, flow_count):
     f = make_alphabet_flow(i + 1)
     flows.append(make_alphabet_flow(i + 1))
-be = impl_memory.MemoryBackend({})
-book = persistence_utils.temporary_log_book(be)
-engines = []
+engine_iters = []
 for f in flows:
-    fd = persistence_utils.create_flow_detail(f, book, be)
-    e = engine.SingleThreadedActionEngine(f, fd, be, {})
+    e = engines.load(f)
     e.compile()
     e.storage.inject({'A': 'A'})
     e.prepare()
-    engines.append(e)
-engine_iters = []
-for e in engines:
     engine_iters.append(e.run_iter())
 while engine_iters:
     for it in list(engine_iters):

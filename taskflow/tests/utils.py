@@ -15,25 +15,31 @@
 #    under the License.
 
 import contextlib
+import string
 import threading
 
+import redis
 import six
 
 from taskflow import exceptions
+from taskflow.listeners import capturing
 from taskflow.persistence.backends import impl_memory
 from taskflow import retry
 from taskflow import task
+from taskflow.types import failure
 from taskflow.utils import kazoo_utils
-from taskflow.utils import misc
+from taskflow.utils import redis_utils
 
 ARGS_KEY = '__args__'
 KWARGS_KEY = '__kwargs__'
 ORDER_KEY = '__order__'
-
 ZK_TEST_CONFIG = {
     'timeout': 1.0,
     'hosts': ["localhost:2181"],
 }
+# If latches/events take longer than this to become empty/set, something is
+# usually wrong and should be debugged instead of deadlocking...
+WAIT_TIMEOUT = 300
 
 
 @contextlib.contextmanager
@@ -47,7 +53,7 @@ def wrap_all_failures():
     try:
         yield
     except Exception:
-        raise exceptions.WrappedFailure([misc.Failure()])
+        raise exceptions.WrappedFailure([failure.Failure()])
 
 
 def zookeeper_available(min_version, timeout=3):
@@ -69,16 +75,71 @@ def zookeeper_available(min_version, timeout=3):
         kazoo_utils.finalize_client(client)
 
 
+def redis_available(min_version):
+    client = redis.StrictRedis()
+    try:
+        client.ping()
+    except Exception:
+        return False
+    else:
+        ok, redis_version = redis_utils.is_server_new_enough(client,
+                                                             min_version)
+        return ok
+
+
+class NoopRetry(retry.AlwaysRevert):
+    pass
+
+
+class NoopTask(task.Task):
+
+    def execute(self):
+        pass
+
+
 class DummyTask(task.Task):
 
     def execute(self, context, *args, **kwargs):
         pass
 
 
+class AddOneSameProvidesRequires(task.Task):
+    default_provides = 'value'
+
+    def execute(self, value):
+        return value + 1
+
+
+class AddOne(task.Task):
+    default_provides = 'result'
+
+    def execute(self, source):
+        return source + 1
+
+
+class GiveBackRevert(task.Task):
+
+    def execute(self, value):
+        return value + 1
+
+    def revert(self, *args, **kwargs):
+        result = kwargs.get('result')
+        # If this somehow fails, timeout, or other don't send back a
+        # valid result...
+        if isinstance(result, six.integer_types):
+            return result + 1
+
+
 class FakeTask(object):
 
     def execute(self, **kwargs):
         pass
+
+
+class LongArgNameTask(task.Task):
+
+    def execute(self, long_arg_name):
+        return long_arg_name
 
 
 if six.PY3:
@@ -103,47 +164,50 @@ class ProvidesRequiresTask(task.Task):
             return dict((k, k) for k in self.provides)
 
 
-def task_callback(state, values, details):
-    name = details.get('task_name', None)
-    if not name:
-        name = details.get('retry_name', '<unknown>')
-    values.append('%s %s' % (name, state))
+# Used to format the captured values into strings (which are easier to
+# check later in tests)...
+LOOKUP_NAME_POSTFIX = {
+    capturing.CaptureListener.TASK: ('.t', 'task_name'),
+    capturing.CaptureListener.RETRY: ('.r', 'retry_name'),
+    capturing.CaptureListener.FLOW: ('.f', 'flow_name'),
+}
 
 
-def flow_callback(state, values, details):
-    values.append('flow %s' % state)
+class CaptureListener(capturing.CaptureListener):
+
+    @staticmethod
+    def _format_capture(kind, state, details):
+        name_postfix, name_key = LOOKUP_NAME_POSTFIX[kind]
+        name = details[name_key] + name_postfix
+        if 'result' in details:
+            name += ' %s(%s)' % (state, details['result'])
+        else:
+            name += " %s" % state
+        return name
 
 
-def register_notifiers(engine, values):
-    engine.notifier.register('*', flow_callback, kwargs={'values': values})
-    engine.task_notifier.register('*', task_callback,
-                                  kwargs={'values': values})
-
-
-class SaveOrderTask(task.Task):
-
-    def __init__(self, name=None, *args, **kwargs):
-        super(SaveOrderTask, self).__init__(name=name, *args, **kwargs)
-        self.values = EngineTestBase.values
-
+class ProgressingTask(task.Task):
     def execute(self, **kwargs):
         self.update_progress(0.0)
-        self.values.append(self.name)
         self.update_progress(1.0)
         return 5
 
     def revert(self, **kwargs):
         self.update_progress(0)
-        self.values.append(self.name + ' reverted(%s)'
-                           % kwargs.get('result'))
         self.update_progress(1.0)
 
 
-class FailingTask(SaveOrderTask):
+class FailingTask(ProgressingTask):
     def execute(self, **kwargs):
         self.update_progress(0)
         self.update_progress(0.99)
         raise RuntimeError('Woot!')
+
+
+class OptionalTask(task.Task):
+    def execute(self, a, b=5):
+        result = a * b
+        return result
 
 
 class TaskWithFailure(task.Task):
@@ -160,7 +224,7 @@ class ProgressingTask(task.Task):
         return 5
 
 
-class FailingTaskWithOneArg(SaveOrderTask):
+class FailingTaskWithOneArg(ProgressingTask):
     def execute(self, x, **kwargs):
         raise RuntimeError('Woot with %s' % x)
 
@@ -269,11 +333,8 @@ class NeverRunningTask(task.Task):
 
 
 class EngineTestBase(object):
-    values = None
-
     def setUp(self):
         super(EngineTestBase, self).setUp()
-        EngineTestBase.values = []
         self.backend = impl_memory.MemoryBackend(conf={})
 
     def tearDown(self):
@@ -284,7 +345,9 @@ class EngineTestBase(object):
         super(EngineTestBase, self).tearDown()
 
     def _make_engine(self, flow, **kwargs):
-        raise NotImplementedError()
+        raise exceptions.NotImplementedError("_make_engine() must be"
+                                             " overridden if an engine is"
+                                             " desired")
 
 
 class FailureMatcher(object):
@@ -309,7 +372,7 @@ class OneReturnRetry(retry.AlwaysRevert):
         pass
 
 
-class ConditionalTask(SaveOrderTask):
+class ConditionalTask(ProgressingTask):
 
     def execute(self, x, y):
         super(ConditionalTask, self).execute()
@@ -317,7 +380,7 @@ class ConditionalTask(SaveOrderTask):
             raise RuntimeError('Woot!')
 
 
-class WaitForOneFromTask(SaveOrderTask):
+class WaitForOneFromTask(ProgressingTask):
 
     def __init__(self, name, wait_for, wait_states, **kwargs):
         super(WaitForOneFromTask, self).__init__(name, **kwargs)
@@ -332,13 +395,11 @@ class WaitForOneFromTask(SaveOrderTask):
         self.event = threading.Event()
 
     def execute(self):
-        # NOTE(imelnikov): if test was not complete within
-        # 5 minutes, something is terribly wrong
-        self.event.wait(300)
-        if not self.event.is_set():
-            raise RuntimeError('Timeout occurred while waiting '
+        if not self.event.wait(WAIT_TIMEOUT):
+            raise RuntimeError('%s second timeout occurred while waiting '
                                'for %s to change state to %s'
-                               % (self.wait_for, self.wait_states))
+                               % (WAIT_TIMEOUT, self.wait_for,
+                                  self.wait_states))
         return super(WaitForOneFromTask, self).execute()
 
     def callback(self, state, details):
@@ -346,3 +407,16 @@ class WaitForOneFromTask(SaveOrderTask):
         if name not in self.wait_for or state not in self.wait_states:
             return
         self.event.set()
+
+
+def make_many(amount, task_cls=DummyTask, offset=0):
+    name_pool = string.ascii_lowercase + string.ascii_uppercase
+    tasks = []
+    while amount > 0:
+        if offset >= len(name_pool):
+            raise AssertionError('Name pool size to small (%s < %s)'
+                                 % (len(name_pool), offset + 1))
+        tasks.append(task_cls(name=name_pool[offset]))
+        offset += 1
+        amount -= 1
+    return tasks

@@ -29,10 +29,8 @@ Contents
    jobs
    conductors
 
-.. toctree::
-   :hidden:
-
-   workers
+Supplementary
+=============
 
 Examples
 --------
@@ -67,16 +65,13 @@ TaskFlow into your project:
 
 * Read over the `paradigm shifts`_ and engage the team in `IRC`_ (or via the
   `openstack-dev`_ mailing list) if these need more explanation (prefix
-  ``[TaskFlow]`` to your emails subject to get an even faster response).
+  ``[Oslo][TaskFlow]`` to your emails subject to get an even faster
+  response).
 * Follow (or at least attempt to follow) some of the established
   `best practices`_ (feel free to add your own suggested best practices).
-
-.. warning::
-
-        External usage of internal helpers and other internal utility functions
-        and modules should be kept to a *minimum* as these may be altered,
-        refactored or moved *without* notice. If you are unsure whether to use
-        a function, class, or module, please ask (see above).
+* Keep in touch with the team (see above); we are all friendly and enjoy
+  knowing your use cases and learning how we can help make your lives easier
+  by adding or adjusting functionality in this library.
 
 .. _IRC: irc://chat.freenode.net/openstack-state-management
 .. _best practices: http://wiki.openstack.org/wiki/TaskFlow/Best_practices
@@ -91,6 +86,31 @@ Miscellaneous
 
    exceptions
    states
+   types
+   utils
+
+Bookshelf
+---------
+
+A useful collection of links, documents, papers, similar
+projects, frameworks and libraries.
+
+.. note::
+
+     Please feel free to submit your own additions and/or changes.
+
+.. toctree::
+   :maxdepth: 1
+
+   shelf
+
+Release notes
+-------------
+
+.. toctree::
+   :maxdepth: 2
+
+   history
 
 Indices and tables
 ==================

@@ -31,20 +31,20 @@ from taskflow.patterns import linear_flow as lf
 from taskflow import task
 
 
-# In this example there are complex dependencies between tasks that are used to
-# perform a simple set of linear equations.
+# In this example there are complex *inferred* dependencies between tasks that
+# are used to perform a simple set of linear equations.
 #
 # As you will see below the tasks just define what they require as input
 # and produce as output (named values). Then the user doesn't care about
-# ordering the TASKS (in this case the tasks calculate pieces of the overall
+# ordering the tasks (in this case the tasks calculate pieces of the overall
 # equation).
 #
-# As you will notice graph_flow resolves dependencies automatically using the
-# tasks requirements and provided values and no ordering dependency has to be
-# manually created.
+# As you will notice a graph flow resolves dependencies automatically using the
+# tasks symbol requirements and provided symbol values and no orderin
+# dependency has to be manually created.
 #
-# Also notice that flows of any types can be nested into a graph_flow; subflows
-# dependencies will be resolved too!! Pretty cool right!
+# Also notice that flows of any types can be nested into a graph flow; showing
+# that subflow dependencies (and associated ordering) will be inferred too.
 
 
 class Adder(task.Task):
@@ -80,12 +80,37 @@ store = {
     "y5": 9,
 }
 
+# This is the expected values that should be created.
+unexpected = 0
+expected = [
+    ('x1', 4),
+    ('x2', 12),
+    ('x3', 16),
+    ('x4', 21),
+    ('x5', 20),
+    ('x6', 41),
+    ('x7', 82),
+]
+
 result = taskflow.engines.run(
-    flow, engine_conf='serial', store=store)
+    flow, engine='serial', store=store)
 
 print("Single threaded engine result %s" % result)
+for (name, value) in expected:
+    actual = result.get(name)
+    if actual != value:
+        sys.stderr.write("%s != %s\n" % (actual, value))
+        unexpected += 1
 
 result = taskflow.engines.run(
-    flow, engine_conf='parallel', store=store)
+    flow, engine='parallel', store=store)
 
 print("Multi threaded engine result %s" % result)
+for (name, value) in expected:
+    actual = result.get(name)
+    if actual != value:
+        sys.stderr.write("%s != %s\n" % (actual, value))
+        unexpected += 1
+
+if unexpected:
+    sys.exit(1)

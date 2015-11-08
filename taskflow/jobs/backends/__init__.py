@@ -15,12 +15,12 @@
 #    under the License.
 
 import contextlib
-import logging
 
 import six
 from stevedore import driver
 
 from taskflow import exceptions as exc
+from taskflow import logging
 from taskflow.utils import misc
 
 
@@ -39,28 +39,28 @@ def fetch(name, conf, namespace=BACKEND_NAMESPACE, **kwargs):
 
     NOTE(harlowja): to aid in making it easy to specify configuration and
     options to a board the configuration (which is typical just a dictionary)
-    can also be a uri string that identifies the entrypoint name and any
+    can also be a URI string that identifies the entrypoint name and any
     configuration specific to that board.
 
-    For example, given the following configuration uri:
+    For example, given the following configuration URI::
 
-    zookeeper://<not-used>/?a=b&c=d
+        zookeeper://<not-used>/?a=b&c=d
 
     This will look for the entrypoint named 'zookeeper' and will provide
-    a configuration object composed of the uris parameters, in this case that
-    is {'a': 'b', 'c': 'd'} to the constructor of that board instance (also
-    including the name specified).
+    a configuration object composed of the URI's components, in this case that
+    is ``{'a': 'b', 'c': 'd'}`` to the constructor of that board
+    instance (also including the name specified).
     """
     if isinstance(conf, six.string_types):
         conf = {'board': conf}
     board = conf['board']
     try:
-        pieces = misc.parse_uri(board)
+        uri = misc.parse_uri(board)
     except (TypeError, ValueError):
         pass
     else:
-        board = pieces['scheme']
-        conf = misc.merge_uri(pieces, conf.copy())
+        board = uri.scheme
+        conf = misc.merge_uri(uri, conf.copy())
     LOG.debug('Looking for %r jobboard driver in %r', board, namespace)
     try:
         mgr = driver.DriverManager(namespace, board,

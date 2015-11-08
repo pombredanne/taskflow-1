@@ -28,13 +28,16 @@ sys.path.insert(0, top_dir)
 import taskflow.engines
 from taskflow.patterns import linear_flow as lf
 from taskflow import task
+from taskflow.types import notifier
+
+ANY = notifier.Notifier.ANY
 
 # INTRO: In this example we create two tasks (this time as functions instead
 # of task subclasses as in the simple_linear.py example), each of which ~calls~
 # a given ~phone~ number (provided as a function input) in a linear fashion
 # (one after the other).
 #
-# For a workflow which is serial this shows a extremely simple way
+# For a workflow which is serial this shows an extremely simple way
 # of structuring your tasks (the code that does the work) into a linear
 # sequence (the flow) and then passing the work off to an engine, with some
 # initial data to be ran in a reliable manner.
@@ -89,11 +92,11 @@ engine = taskflow.engines.load(flow, store={
 })
 
 # This is where we attach our callback functions to the 2 different
-# notification objects that a engine exposes. The usage of a '*' (kleene star)
+# notification objects that an engine exposes. The usage of a ANY (kleene star)
 # here means that we want to be notified on all state changes, if you want to
 # restrict to a specific state change, just register that instead.
-engine.notifier.register('*', flow_watch)
-engine.task_notifier.register('*', task_watch)
+engine.notifier.register(ANY, flow_watch)
+engine.atom_notifier.register(ANY, task_watch)
 
 # And now run!
 engine.run()

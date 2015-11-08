@@ -1,46 +1,42 @@
-===========================
-Notifications and Listeners
-===========================
+---------------------------
+Notifications and listeners
+---------------------------
 
 .. testsetup::
 
     from taskflow import task
     from taskflow.patterns import linear_flow
     from taskflow import engines
+    from taskflow.types import notifier
+    ANY = notifier.Notifier.ANY
 
---------
 Overview
---------
+========
 
 Engines provide a way to receive notification on task and flow state
-transitions, which is useful for monitoring, logging, metrics, debugging
-and plenty of other tasks.
+transitions (see :doc:`states <states>`), which is useful for
+monitoring, logging, metrics, debugging and plenty of other tasks.
 
 To receive these notifications you should register a callback with
-an instance of the the :py:class:`notifier <taskflow.utils.misc.Notifier>`
-class that is attached
-to :py:class:`engine <taskflow.engines.base.EngineBase>`
-attributes ``task_notifier`` and ``notifier``.
+an instance of the :py:class:`~taskflow.types.notifier.Notifier`
+class that is attached to :py:class:`~taskflow.engines.base.Engine`
+attributes ``atom_notifier`` and ``notifier``.
 
 TaskFlow also comes with a set of predefined :ref:`listeners <listeners>`, and
 provides means to write your own listeners, which can be more convenient than
 using raw callbacks.
 
---------------------------------------
 Receiving notifications with callbacks
---------------------------------------
-
-To manage notifications instances of
-:py:class:`~taskflow.utils.misc.Notifier` are used.
-
-.. autoclass:: taskflow.utils.misc.Notifier
+======================================
 
 Flow notifications
 ------------------
 
-To receive notification on flow state changes use
-:py:class:`~taskflow.utils.misc.Notifier` available as
-``notifier`` property of the engine. A basic example is:
+To receive notification on flow state changes use the
+:py:class:`~taskflow.types.notifier.Notifier` instance available as the
+``notifier`` property of an engine.
+
+A basic example is:
 
 .. doctest::
 
@@ -61,7 +57,7 @@ To receive notification on flow state changes use
    >>> flo = linear_flow.Flow("cat-dog").add(
    ...   CatTalk(), DogTalk(provides="dog"))
    >>> eng = engines.load(flo, store={'meow': 'meow', 'woof': 'woof'})
-   >>> eng.notifier.register("*", flow_transition)
+   >>> eng.notifier.register(ANY, flow_transition)
    >>> eng.run()
    Flow 'cat-dog' transition to state RUNNING
    meow
@@ -71,9 +67,11 @@ To receive notification on flow state changes use
 Task notifications
 ------------------
 
-To receive notification on task state changes use
-:py:class:`~taskflow.utils.misc.Notifier` available as
-``task_notifier`` property of the engine. A basic example is:
+To receive notification on task state changes use the
+:py:class:`~taskflow.types.notifier.Notifier` instance available as the
+``atom_notifier`` property of an engine.
+
+A basic example is:
 
 .. doctest::
 
@@ -95,7 +93,7 @@ To receive notification on task state changes use
    >>> flo.add(CatTalk(), DogTalk(provides="dog"))
    <taskflow.patterns.linear_flow.Flow object at 0x...>
    >>> eng = engines.load(flo, store={'meow': 'meow', 'woof': 'woof'})
-   >>> eng.task_notifier.register("*", task_transition)
+   >>> eng.task_notifier.register(ANY, task_transition)
    >>> eng.run()
    Task 'CatTalk' transition to state RUNNING
    meow
@@ -106,9 +104,8 @@ To receive notification on task state changes use
 
 .. _listeners:
 
----------
 Listeners
----------
+=========
 
 TaskFlow comes with a set of predefined listeners -- helper classes that can be
 used to do various actions on flow and/or tasks transitions. You can also
@@ -138,30 +135,68 @@ For example, this is how you can use
    >>> with printing.PrintingListener(eng):
    ...   eng.run()
    ...
-   taskflow.engines.action_engine.engine.SingleThreadedActionEngine: ... has moved flow 'cat-dog' (...) into state 'RUNNING'
-   taskflow.engines.action_engine.engine.SingleThreadedActionEngine: ... has moved task 'CatTalk' (...) into state 'RUNNING'
+   <taskflow.engines.action_engine.engine.SerialActionEngine object at ...> has moved flow 'cat-dog' (...) into state 'RUNNING' from state 'PENDING'
+   <taskflow.engines.action_engine.engine.SerialActionEngine object at ...> has moved task 'CatTalk' (...) into state 'RUNNING' from state 'PENDING'
    meow
-   taskflow.engines.action_engine.engine.SingleThreadedActionEngine: ... has moved task 'CatTalk' (...) into state 'SUCCESS' with result 'cat' (failure=False)
-   taskflow.engines.action_engine.engine.SingleThreadedActionEngine: ... has moved task 'DogTalk' (...) into state 'RUNNING'
+   <taskflow.engines.action_engine.engine.SerialActionEngine object at ...> has moved task 'CatTalk' (...) into state 'SUCCESS' from state 'RUNNING' with result 'cat' (failure=False)
+   <taskflow.engines.action_engine.engine.SerialActionEngine object at ...> has moved task 'DogTalk' (...) into state 'RUNNING' from state 'PENDING'
    woof
-   taskflow.engines.action_engine.engine.SingleThreadedActionEngine: ... has moved task 'DogTalk' (...) into state 'SUCCESS' with result 'dog' (failure=False)
-   taskflow.engines.action_engine.engine.SingleThreadedActionEngine: ... has moved flow 'cat-dog' (...) into state 'SUCCESS'
+   <taskflow.engines.action_engine.engine.SerialActionEngine object at ...> has moved task 'DogTalk' (...) into state 'SUCCESS' from state 'RUNNING' with result 'dog' (failure=False)
+   <taskflow.engines.action_engine.engine.SerialActionEngine object at ...> has moved flow 'cat-dog' (...) into state 'SUCCESS' from state 'RUNNING'
 
-Basic listener
---------------
+Interfaces
+==========
 
-.. autoclass:: taskflow.listeners.base.ListenerBase
+.. automodule:: taskflow.listeners.base
+
+Implementations
+===============
 
 Printing and logging listeners
 ------------------------------
 
-.. autoclass:: taskflow.listeners.base.LoggingBase
-
 .. autoclass:: taskflow.listeners.logging.LoggingListener
+
+.. autoclass:: taskflow.listeners.logging.DynamicLoggingListener
 
 .. autoclass:: taskflow.listeners.printing.PrintingListener
 
-Timing listener
----------------
+Timing listeners
+----------------
 
-.. autoclass:: taskflow.listeners.timing.TimingListener
+.. autoclass:: taskflow.listeners.timing.DurationListener
+
+.. autoclass:: taskflow.listeners.timing.PrintingDurationListener
+
+.. autoclass:: taskflow.listeners.timing.EventTimeListener
+
+Claim listener
+--------------
+
+.. autoclass:: taskflow.listeners.claims.CheckingClaimListener
+
+Capturing listener
+------------------
+
+.. autoclass:: taskflow.listeners.capturing.CaptureListener
+
+Formatters
+----------
+
+.. automodule:: taskflow.formatters
+
+Hierarchy
+=========
+
+.. inheritance-diagram::
+    taskflow.listeners.base.DumpingListener
+    taskflow.listeners.base.Listener
+    taskflow.listeners.capturing.CaptureListener
+    taskflow.listeners.claims.CheckingClaimListener
+    taskflow.listeners.logging.DynamicLoggingListener
+    taskflow.listeners.logging.LoggingListener
+    taskflow.listeners.printing.PrintingListener
+    taskflow.listeners.timing.PrintingDurationListener
+    taskflow.listeners.timing.EventTimeListener
+    taskflow.listeners.timing.DurationListener
+    :parts: 1

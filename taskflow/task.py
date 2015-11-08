@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+#    Copyright 2015 Hewlett-Packard Development Company, L.P.
 #    Copyright (C) 2013 Rackspace Hosting Inc. All Rights Reserved.
 #    Copyright (C) 2013 Yahoo! Inc. All Rights Reserved.
 #
@@ -16,16 +17,30 @@
 #    under the License.
 
 import abc
-import collections
-import contextlib
-import logging
+import copy
 
+from oslo_utils import reflection
 import six
+from six.moves import map as compat_map
+from six.moves import reduce as compat_reduce
 
 from taskflow import atom
-from taskflow.utils import reflection
+from taskflow import logging
+from taskflow.types import notifier
+from taskflow.utils import misc
 
 LOG = logging.getLogger(__name__)
+
+# Constants passed into revert kwargs.
+#
+# Contain the execute() result (if any).
+REVERT_RESULT = 'result'
+#
+# The cause of the flow failure/s
+REVERT_FLOW_FAILURES = 'flow_failures'
+
+# Common events
+EVENT_UPDATE_PROGRESS = 'update_progress'
 
 
 @six.add_metaclass(abc.ABCMeta)
@@ -38,21 +53,35 @@ class BaseTask(atom.Atom):
     same piece of work.
     """
 
-    TASK_EVENTS = ('update_progress', )
+    # Known internal events this task can have callbacks bound to (others that
+    # are not in this set/tuple will not be able to be bound); this should be
+    # updated and/or extended in subclasses as needed to enable or disable new
+    # or existing internal events...
+    TASK_EVENTS = (EVENT_UPDATE_PROGRESS,)
 
     def __init__(self, name, provides=None, inject=None):
         if name is None:
             name = reflection.get_class_name(self)
         super(BaseTask, self).__init__(name, provides, inject=inject)
-        # Map of events => lists of callbacks to invoke on task events.
-        self._events_listeners = collections.defaultdict(list)
+        self._notifier = notifier.RestrictedNotifier(self.TASK_EVENTS)
+
+    @property
+    def notifier(self):
+        """Internal notification dispatcher/registry.
+
+        A notification object that will dispatch events that occur related
+        to *internal* notifications that the task internally emits to
+        listeners (for example for progress status updates, telling others
+        that a task has reached 50% completion...).
+        """
+        return self._notifier
 
     def pre_execute(self):
         """Code to be run prior to executing the task.
 
         A common pattern for initializing the state of the system prior to
         running tasks is to define some code in a base class that all your
-        tasks inherit from.  In that class, you can define a pre_execute
+        tasks inherit from.  In that class, you can define a ``pre_execute``
         method and it will always be invoked just prior to your tasks running.
         """
 
@@ -72,6 +101,9 @@ class BaseTask(atom.Atom):
         happens in a different python process or on a remote machine) and so
         that the result can be transmitted to other tasks (which may be local
         or remote).
+
+        :param args: positional arguments that task requires to execute.
+        :param kwargs: any keyword arguments that task requires to execute.
         """
 
     def post_execute(self):
@@ -79,7 +111,7 @@ class BaseTask(atom.Atom):
 
         A common pattern for cleaning up global state of the system after the
         execution of tasks is to define some code in a base class that all your
-        tasks inherit from.  In that class, you can define a post_execute
+        tasks inherit from.  In that class, you can define a ``post_execute``
         method and it will always be invoked just after your tasks execute,
         regardless of whether they succeded or not.
 
@@ -90,7 +122,7 @@ class BaseTask(atom.Atom):
     def pre_revert(self):
         """Code to be run prior to reverting the task.
 
-        This works the same as pre_execute, but for the revert phase.
+        This works the same as :meth:`.pre_execute`, but for the revert phase.
         """
 
     def revert(self, *args, **kwargs):
@@ -98,125 +130,69 @@ class BaseTask(atom.Atom):
 
         This method should undo any side-effects caused by previous execution
         of the task using the result of the :py:meth:`execute` method and
-        information on failure which triggered reversion of the flow.
+        information on the failure which triggered reversion of the flow the
+        task is contained in (if applicable).
 
-        NOTE(harlowja): The ``**kwargs`` which are passed into the
-        :py:meth:`execute` method will also be passed into this method. The
-        ``**kwargs`` key ``'result'`` will contain the :py:meth:`execute`
-        result (if any) and the ``**kwargs`` key ``'flow_failures'`` will
-        contain the failure information.
+        :param args: positional arguments that the task required to execute.
+        :param kwargs: any keyword arguments that the task required to
+                       execute; the special key ``'result'`` will contain
+                       the :py:meth:`execute` result (if any) and
+                       the ``**kwargs`` key ``'flow_failures'`` will contain
+                       any failure information.
         """
 
     def post_revert(self):
         """Code to be run after reverting the task.
 
-        This works the same as post_execute, but for the revert phase.
+        This works the same as :meth:`.post_execute`, but for the revert phase.
         """
 
-    def update_progress(self, progress, **kwargs):
+    def copy(self, retain_listeners=True):
+        """Clone/copy this task.
+
+        :param retain_listeners: retain the attached notification listeners
+                                 when cloning, when false the listeners will
+                                 be emptied, when true the listeners will be
+                                 copied and retained
+
+        :return: the copied task
+        """
+        c = copy.copy(self)
+        c._notifier = self._notifier.copy()
+        if not retain_listeners:
+            c._notifier.reset()
+        return c
+
+    def update_progress(self, progress):
         """Update task progress and notify all registered listeners.
 
-        :param progress: task progress float value between 0 and 1
-        :param kwargs: task specific progress information
+        :param progress: task progress float value between 0.0 and 1.0
         """
-        if progress > 1.0:
-            LOG.warn("Progress must be <= 1.0, clamping to upper bound")
-            progress = 1.0
-        if progress < 0.0:
-            LOG.warn("Progress must be >= 0.0, clamping to lower bound")
-            progress = 0.0
-        self._trigger('update_progress', progress, **kwargs)
-
-    def _trigger(self, event, *args, **kwargs):
-        """Execute all handlers for the given event type."""
-        for (handler, event_data) in self._events_listeners.get(event, []):
-            try:
-                handler(self, event_data, *args, **kwargs)
-            except Exception:
-                LOG.warn("Failed calling `%s` on event '%s'",
-                         reflection.get_callable_name(handler), event,
-                         exc_info=True)
-
-    @contextlib.contextmanager
-    def autobind(self, event_name, handler_func, **kwargs):
-        """Binds & unbinds a given event handler to the task.
-
-        This function binds and unbinds using the context manager protocol.
-        When events are triggered on the task of the given event name this
-        handler will automatically be called with the provided keyword
-        arguments.
-        """
-        bound = False
-        if handler_func is not None:
-            try:
-                self.bind(event_name, handler_func, **kwargs)
-                bound = True
-            except ValueError:
-                LOG.warn("Failed binding functor `%s` as a receiver of"
-                         " event '%s' notifications emitted from task %s",
-                         handler_func, event_name, self, exc_info=True)
-        try:
-            yield self
-        finally:
-            if bound:
-                self.unbind(event_name, handler_func)
-
-    def bind(self, event, handler, **kwargs):
-        """Attach a handler to an event for the task.
-
-        :param event: event type
-        :param handler: callback to execute each time event is triggered
-        :param kwargs: optional named parameters that will be passed to the
-                       event handler
-        :raises ValueError: if invalid event type passed
-        """
-        if event not in self.TASK_EVENTS:
-            raise ValueError("Unknown task event '%s', can only bind"
-                             " to events %s" % (event, self.TASK_EVENTS))
-        assert six.callable(handler), "Handler must be callable"
-        self._events_listeners[event].append((handler, kwargs))
-
-    def unbind(self, event, handler=None):
-        """Remove a previously-attached event handler from the task.
-
-        If a handler function not passed, then this will unbind all event
-        handlers for the provided event. If multiple of the same handlers are
-        bound, then the first match is removed (and only the first match).
-
-        :param event: event type
-        :param handler: handler previously bound
-
-        :rtype: boolean
-        :return: whether anything was removed
-        """
-        removed_any = False
-        if not handler:
-            removed_any = self._events_listeners.pop(event, removed_any)
-        else:
-            event_listeners = self._events_listeners.get(event, [])
-            for i, (handler2, _event_data) in enumerate(event_listeners):
-                if reflection.is_same_callback(handler, handler2):
-                    event_listeners.pop(i)
-                    removed_any = True
-                    break
-        return bool(removed_any)
+        def on_clamped():
+            LOG.warn("Progress value must be greater or equal to 0.0 or less"
+                     " than or equal to 1.0 instead of being '%s'", progress)
+        cleaned_progress = misc.clamp(progress, 0.0, 1.0,
+                                      on_clamped=on_clamped)
+        self._notifier.notify(EVENT_UPDATE_PROGRESS,
+                              {'progress': cleaned_progress})
 
 
 class Task(BaseTask):
-    """Base class for user-defined tasks.
+    """Base class for user-defined tasks (derive from it at will!).
 
-    Adds following features to Task:
-        - auto-generates name from type of self
-        - adds all execute argument names to task requirements
-        - items provided by the task may be specified via
-          'default_provides' class attribute or property
+    Adds the following features on top of the :py:class:`.BaseTask`:
+
+    - Auto-generates a name from the class name if a name is not
+      explicitly provided.
+    - Automatically adds all :py:meth:`.BaseTask.execute` argument names to
+      the task requirements (items provided by the task may be also specified
+      via ``default_provides`` class attribute or instance property).
     """
 
     default_provides = None
 
     def __init__(self, name=None, provides=None, requires=None,
                  auto_extract=True, rebind=None, inject=None):
-        """Initialize task instance."""
         if provides is None:
             provides = self.default_provides
         super(Task, self).__init__(name, provides=provides, inject=inject)
@@ -226,17 +202,23 @@ class Task(BaseTask):
 class FunctorTask(BaseTask):
     """Adaptor to make a task from a callable.
 
-    Take any callable and make a task from it.
+    Take any callable pair and make a task from it.
+
+    NOTE(harlowja): If a name is not provided the function/method name of
+    the ``execute`` callable will be used as the name instead (the name of
+    the ``revert`` callable is not used).
     """
 
     def __init__(self, execute, name=None, provides=None,
                  requires=None, auto_extract=True, rebind=None, revert=None,
                  version=None, inject=None):
-        assert six.callable(execute), ("Function to use for executing must be"
-                                       " callable")
-        if revert:
-            assert six.callable(revert), ("Function to use for reverting must"
-                                          " be callable")
+        if not six.callable(execute):
+            raise ValueError("Function to use for executing must be"
+                             " callable")
+        if revert is not None:
+            if not six.callable(revert):
+                raise ValueError("Function to use for reverting must"
+                                 " be callable")
         if name is None:
             name = reflection.get_callable_name(execute)
         super(FunctorTask, self).__init__(name, provides=provides,
@@ -255,3 +237,90 @@ class FunctorTask(BaseTask):
             return self._revert(*args, **kwargs)
         else:
             return None
+
+
+class ReduceFunctorTask(BaseTask):
+    """General purpose Task to reduce a list by applying a function.
+
+    This Task mimics the behavior of Python's built-in ``reduce`` function. The
+    Task takes a functor (lambda or otherwise) and a list. The list is
+    specified using the ``requires`` argument of the Task. When executed, this
+    task calls ``reduce`` with the functor and list as arguments. The resulting
+    value from the call to ``reduce`` is then returned after execution.
+    """
+    def __init__(self, functor, requires, name=None, provides=None,
+                 auto_extract=True, rebind=None, inject=None):
+
+        if not six.callable(functor):
+            raise ValueError("Function to use for reduce must be callable")
+
+        f_args = reflection.get_callable_args(functor)
+        if len(f_args) != 2:
+            raise ValueError("%s arguments were provided. Reduce functor "
+                             "must take exactly 2 arguments." % len(f_args))
+
+        if not misc.is_iterable(requires):
+            raise TypeError("%s type was provided for requires. Requires "
+                            "must be an iterable." % type(requires))
+
+        if len(requires) < 2:
+            raise ValueError("%s elements were provided. Requires must have "
+                             "at least 2 elements." % len(requires))
+
+        if name is None:
+            name = reflection.get_callable_name(functor)
+        super(ReduceFunctorTask, self).__init__(name=name, provides=provides,
+                                                inject=inject)
+
+        self._functor = functor
+
+        self._build_arg_mapping(executor=self.execute, requires=requires,
+                                rebind=rebind, auto_extract=auto_extract)
+
+    def execute(self, *args, **kwargs):
+        l = [kwargs[r] for r in self.requires]
+        return compat_reduce(self._functor, l)
+
+
+class MapFunctorTask(BaseTask):
+    """General purpose Task to map a function to a list.
+
+    This Task mimics the behavior of Python's built-in ``map`` function. The
+    Task takes a functor (lambda or otherwise) and a list. The list is
+    specified using the ``requires`` argument of the Task. When executed, this
+    task calls ``map`` with the functor and list as arguments. The resulting
+    list from the call to ``map`` is then returned after execution.
+
+    Each value of the returned list can be bound to individual names using
+    the ``provides`` argument, following taskflow standard behavior. Order is
+    preserved in the returned list.
+    """
+
+    def __init__(self, functor, requires, name=None, provides=None,
+                 auto_extract=True, rebind=None, inject=None):
+
+        if not six.callable(functor):
+            raise ValueError("Function to use for map must be callable")
+
+        f_args = reflection.get_callable_args(functor)
+        if len(f_args) != 1:
+            raise ValueError("%s arguments were provided. Map functor must "
+                             "take exactly 1 argument." % len(f_args))
+
+        if not misc.is_iterable(requires):
+            raise TypeError("%s type was provided for requires. Requires "
+                            "must be an iterable." % type(requires))
+
+        if name is None:
+            name = reflection.get_callable_name(functor)
+        super(MapFunctorTask, self).__init__(name=name, provides=provides,
+                                             inject=inject)
+
+        self._functor = functor
+
+        self._build_arg_mapping(executor=self.execute, requires=requires,
+                                rebind=rebind, auto_extract=auto_extract)
+
+    def execute(self, *args, **kwargs):
+        l = [kwargs[r] for r in self.requires]
+        return list(compat_map(self._functor, l))

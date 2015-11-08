@@ -21,11 +21,16 @@ from taskflow import test
 
 class TransitionTest(test.TestCase):
 
+    _DISALLOWED_TPL = "Transition from '%s' to '%s' was found to be disallowed"
+    _NOT_IGNORED_TPL = "Transition from '%s' to '%s' was not ignored"
+
     def assertTransitionAllowed(self, from_state, to_state):
-        self.assertTrue(self.check_transition(from_state, to_state))
+        msg = self._DISALLOWED_TPL % (from_state, to_state)
+        self.assertTrue(self.check_transition(from_state, to_state), msg=msg)
 
     def assertTransitionIgnored(self, from_state, to_state):
-        self.assertFalse(self.check_transition(from_state, to_state))
+        msg = self._NOT_IGNORED_TPL % (from_state, to_state)
+        self.assertFalse(self.check_transition(from_state, to_state), msg=msg)
 
     def assertTransitionForbidden(self, from_state, to_state):
         self.assertRaisesRegexp(exc.InvalidState,
@@ -87,7 +92,7 @@ class CheckTaskTransitionTest(TransitionTest):
 
     def test_from_success_state(self):
         self.assertTransitions(from_state=states.SUCCESS,
-                               allowed=(states.REVERTING, states.RETRYING),
+                               allowed=(states.REVERTING,),
                                ignored=(states.RUNNING, states.SUCCESS,
                                         states.PENDING, states.FAILURE,
                                         states.REVERTED))
@@ -101,7 +106,8 @@ class CheckTaskTransitionTest(TransitionTest):
 
     def test_from_reverting_state(self):
         self.assertTransitions(from_state=states.REVERTING,
-                               allowed=(states.FAILURE, states.REVERTED),
+                               allowed=(states.REVERT_FAILURE,
+                                        states.REVERTED),
                                ignored=(states.RUNNING, states.REVERTING,
                                         states.PENDING, states.SUCCESS))
 
@@ -111,6 +117,21 @@ class CheckTaskTransitionTest(TransitionTest):
                                ignored=(states.REVERTING, states.REVERTED,
                                         states.RUNNING,
                                         states.SUCCESS, states.FAILURE))
+
+
+class CheckRetryTransitionTest(CheckTaskTransitionTest):
+
+    def setUp(self):
+        super(CheckRetryTransitionTest, self).setUp()
+        self.check_transition = states.check_retry_transition
+        self.transition_exc_regexp = '^Retry transition.*not allowed'
+
+    def test_from_success_state(self):
+        self.assertTransitions(from_state=states.SUCCESS,
+                               allowed=(states.REVERTING, states.RETRYING),
+                               ignored=(states.RUNNING, states.SUCCESS,
+                                        states.PENDING, states.FAILURE,
+                                        states.REVERTED))
 
     def test_from_retrying_state(self):
         self.assertTransitions(from_state=states.RETRYING,

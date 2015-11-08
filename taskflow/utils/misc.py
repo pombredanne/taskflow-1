@@ -17,29 +17,31 @@
 
 import collections
 import contextlib
-import copy
 import datetime
 import errno
 import inspect
-import keyword
-import logging
 import os
 import re
-import string
 import sys
-import time
-import traceback
+import threading
+import types
 
+import enum
+from oslo_serialization import jsonutils
+from oslo_serialization import msgpackutils
+from oslo_utils import encodeutils
+from oslo_utils import importutils
+from oslo_utils import netutils
+from oslo_utils import reflection
 import six
-from six.moves.urllib import parse as urlparse
+from six.moves import map as compat_map
+from six.moves import range as compat_range
 
-from taskflow import exceptions as exc
-from taskflow.openstack.common import jsonutils
-from taskflow.openstack.common import network_utils
-from taskflow.utils import reflection
+from taskflow.types import failure
+from taskflow.types import notifier
+from taskflow.utils import deprecation
 
 
-LOG = logging.getLogger(__name__)
 NUMERIC_TYPES = six.integer_types + (float,)
 
 # NOTE(imelnikov): regular expression to get scheme from URI,
@@ -47,107 +49,289 @@ NUMERIC_TYPES = six.integer_types + (float,)
 _SCHEME_REGEX = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*):")
 
 
-def merge_uri(uri_pieces, conf):
+class StrEnum(str, enum.Enum):
+    """An enumeration that is also a string and can be compared to strings."""
+
+    def __new__(cls, *args, **kwargs):
+        for a in args:
+            if not isinstance(a, str):
+                raise TypeError("Enumeration '%s' (%s) is not"
+                                " a string" % (a, type(a).__name__))
+        return super(StrEnum, cls).__new__(cls, *args, **kwargs)
+
+
+class StringIO(six.StringIO):
+    """String buffer with some small additions."""
+
+    def write_nl(self, value, linesep=os.linesep):
+        self.write(value)
+        self.write(linesep)
+
+
+def match_type(obj, matchers):
+    """Matches a given object using the given matchers list/iterable.
+
+    NOTE(harlowja): each element of the provided list/iterable must be
+    tuple of (valid types, result).
+
+    Returns the result (the second element of the provided tuple) if a type
+    match occurs, otherwise none if no matches are found.
+    """
+    for (match_types, match_result) in matchers:
+        if isinstance(obj, match_types):
+            return match_result
+    else:
+        return None
+
+
+def countdown_iter(start_at, decr=1):
+    """Generator that decrements after each generation until <= zero.
+
+    NOTE(harlowja): we can likely remove this when we can use an
+    ``itertools.count`` that takes a step (on py2.6 which we still support
+    that step parameter does **not** exist and therefore can't be used).
+    """
+    if decr <= 0:
+        raise ValueError("Decrement value must be greater"
+                         " than zero and not %s" % decr)
+    while start_at > 0:
+        yield start_at
+        start_at -= decr
+
+
+def reverse_enumerate(items):
+    """Like reversed(enumerate(items)) but with less copying/cloning..."""
+    for i in countdown_iter(len(items)):
+        yield i - 1, items[i - 1]
+
+
+def merge_uri(uri, conf):
     """Merges a parsed uri into the given configuration dictionary.
 
-    Merges the username, password, hostname, and query params of a uri into
-    the given configuration (it does not overwrite the configuration keys if
-    they already exist) and returns the adjusted configuration.
+    Merges the username, password, hostname, port, and query parameters of
+    a URI into the given configuration dictionary (it does **not** overwrite
+    existing configuration keys if they already exist) and returns the merged
+    configuration.
 
     NOTE(harlowja): does not merge the path, scheme or fragment.
     """
-    for k in ('username', 'password'):
-        if not uri_pieces[k]:
-            continue
-        conf.setdefault(k, uri_pieces[k])
-    hostname = uri_pieces.get('hostname')
+    uri_port = uri.port
+    specials = [
+        ('username', uri.username, lambda v: bool(v)),
+        ('password', uri.password, lambda v: bool(v)),
+        # NOTE(harlowja): A different check function is used since 0 is
+        # false (when bool(v) is applied), and that is a valid port...
+        ('port', uri_port, lambda v: v is not None),
+    ]
+    hostname = uri.hostname
     if hostname:
-        port = uri_pieces.get('port')
-        if port is not None:
-            hostname += ":%s" % (port)
-        conf.setdefault('hostname', hostname)
-    for (k, v) in six.iteritems(uri_pieces['params']):
+        if uri_port is not None:
+            hostname += ":%s" % (uri_port)
+        specials.append(('hostname', hostname, lambda v: bool(v)))
+    for (k, v, is_not_empty_value_func) in specials:
+        if is_not_empty_value_func(v):
+            conf.setdefault(k, v)
+    for (k, v) in six.iteritems(uri.params()):
         conf.setdefault(k, v)
     return conf
 
 
-def parse_uri(uri, query_duplicates=False):
+def find_subclasses(locations, base_cls, exclude_hidden=True):
+    """Finds subclass types in the given locations.
+
+    This will examines the given locations for types which are subclasses of
+    the base class type provided and returns the found subclasses (or fails
+    with exceptions if this introspection can not be accomplished).
+
+    If a string is provided as one of the locations it will be imported and
+    examined if it is a subclass of the base class. If a module is given,
+    all of its members will be examined for attributes which are subclasses of
+    the base class. If a type itself is given it will be examined for being a
+    subclass of the base class.
+    """
+    derived = set()
+    for item in locations:
+        module = None
+        if isinstance(item, six.string_types):
+            try:
+                pkg, cls = item.split(':')
+            except ValueError:
+                module = importutils.import_module(item)
+            else:
+                obj = importutils.import_class('%s.%s' % (pkg, cls))
+                if not reflection.is_subclass(obj, base_cls):
+                    raise TypeError("Object '%s' (%s) is not a '%s' subclass"
+                                    % (item, type(item), base_cls))
+                derived.add(obj)
+        elif isinstance(item, types.ModuleType):
+            module = item
+        elif reflection.is_subclass(item, base_cls):
+            derived.add(item)
+        else:
+            raise TypeError("Object '%s' (%s) is an unexpected type" %
+                            (item, type(item)))
+        # If it's a module derive objects from it if we can.
+        if module is not None:
+            for (name, obj) in inspect.getmembers(module):
+                if name.startswith("_") and exclude_hidden:
+                    continue
+                if reflection.is_subclass(obj, base_cls):
+                    derived.add(obj)
+    return derived
+
+
+def pick_first_not_none(*values):
+    """Returns first of values that is *not* None (or None if all are/were)."""
+    for val in values:
+        if val is not None:
+            return val
+    return None
+
+
+def parse_uri(uri):
     """Parses a uri into its components."""
     # Do some basic validation before continuing...
     if not isinstance(uri, six.string_types):
         raise TypeError("Can only parse string types to uri data, "
-                        "and not an object of type %s"
-                        % reflection.get_class_name(uri))
+                        "and not '%s' (%s)" % (uri, type(uri)))
     match = _SCHEME_REGEX.match(uri)
     if not match:
-        raise ValueError("Uri %r does not start with a RFC 3986 compliant"
+        raise ValueError("Uri '%s' does not start with a RFC 3986 compliant"
                          " scheme" % (uri))
-    parsed = network_utils.urlsplit(uri)
-    if parsed.query:
-        query_params = urlparse.parse_qsl(parsed.query)
-        if not query_duplicates:
-            query_params = dict(query_params)
-        else:
-            # Retain duplicates in a list for keys which have duplicates, but
-            # for items which are not duplicated, just associate the key with
-            # the value.
-            tmp_query_params = {}
-            for (k, v) in query_params:
-                if k in tmp_query_params:
-                    p_v = tmp_query_params[k]
-                    if isinstance(p_v, list):
-                        p_v.append(v)
-                    else:
-                        p_v = [p_v, v]
-                        tmp_query_params[k] = p_v
-                else:
-                    tmp_query_params[k] = v
-            query_params = tmp_query_params
+    return netutils.urlsplit(uri)
+
+
+def look_for(haystack, needles, extractor=None):
+    """Find items in haystack and returns matches found (in haystack order).
+
+    Given a list of items (the haystack) and a list of items to look for (the
+    needles) this will look for the needles in the haystack and returns
+    the found needles (if any). The ordering of the returned needles is in the
+    order they are located in the haystack.
+
+    Example input and output:
+
+    >>> from taskflow.utils import misc
+    >>> hay = [3, 2, 1]
+    >>> misc.look_for(hay, [1, 2])
+    [2, 1]
+    """
+    if not haystack:
+        return []
+    if extractor is None:
+        extractor = lambda v: v
+    matches = []
+    for i, v in enumerate(needles):
+        try:
+            matches.append((haystack.index(extractor(v)), i))
+        except ValueError:
+            pass
+    if not matches:
+        return []
     else:
-        query_params = {}
-    return AttrDict(
-        scheme=parsed.scheme,
-        username=parsed.username,
-        password=parsed.password,
-        fragment=parsed.fragment,
-        path=parsed.path,
-        params=query_params,
-        hostname=parsed.hostname,
-        port=parsed.port)
+        return [needles[i] for (_hay_i, i) in sorted(matches)]
 
 
-def binary_encode(text, encoding='utf-8'):
-    """Converts a string of into a binary type using given encoding.
+def disallow_when_frozen(excp_cls):
+    """Frozen checking/raising method decorator."""
 
-    Does nothing if text not unicode string.
+    def decorator(f):
+
+        @six.wraps(f)
+        def wrapper(self, *args, **kwargs):
+            if self.frozen:
+                raise excp_cls()
+            else:
+                return f(self, *args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def clamp(value, minimum, maximum, on_clamped=None):
+    """Clamps a value to ensure its >= minimum and <= maximum."""
+    if minimum > maximum:
+        raise ValueError("Provided minimum '%s' must be less than or equal to"
+                         " the provided maximum '%s'" % (minimum, maximum))
+    if value > maximum:
+        value = maximum
+        if on_clamped is not None:
+            on_clamped()
+    if value < minimum:
+        value = minimum
+        if on_clamped is not None:
+            on_clamped()
+    return value
+
+
+def fix_newlines(text, replacement=os.linesep):
+    """Fixes text that *may* end with wrong nl by replacing with right nl."""
+    return replacement.join(text.splitlines())
+
+
+def binary_encode(text, encoding='utf-8', errors='strict'):
+    """Encodes a text string into a binary string using given encoding.
+
+    Does nothing if data is already a binary string (raises on unknown types).
     """
     if isinstance(text, six.binary_type):
         return text
-    elif isinstance(text, six.text_type):
-        return text.encode(encoding)
     else:
-        raise TypeError("Expected binary or string type")
+        return encodeutils.safe_encode(text, encoding=encoding,
+                                       errors=errors)
 
 
-def binary_decode(data, encoding='utf-8'):
-    """Converts a binary type into a text type using given encoding.
+def binary_decode(data, encoding='utf-8', errors='strict'):
+    """Decodes a binary string into a text string using given encoding.
 
-    Does nothing if data is already unicode string.
+    Does nothing if data is already a text string (raises on unknown types).
     """
-    if isinstance(data, six.binary_type):
-        return data.decode(encoding)
-    elif isinstance(data, six.text_type):
+    if isinstance(data, six.text_type):
         return data
     else:
-        raise TypeError("Expected binary or string type")
+        return encodeutils.safe_decode(data, incoming=encoding,
+                                       errors=errors)
+
+
+def _check_decoded_type(data, root_types=(dict,)):
+    if root_types:
+        if not isinstance(root_types, tuple):
+            root_types = tuple(root_types)
+        if not isinstance(data, root_types):
+            if len(root_types) == 1:
+                root_type = root_types[0]
+                raise ValueError("Expected '%s' root type not '%s'"
+                                 % (root_type, type(data)))
+            else:
+                raise ValueError("Expected %s root types not '%s'"
+                                 % (list(root_types), type(data)))
+    return data
+
+
+def decode_msgpack(raw_data, root_types=(dict,)):
+    """Parse raw data to get decoded object.
+
+    Decodes a msgback encoded 'blob' from a given raw data binary string and
+    checks that the root type of that decoded object is in the allowed set of
+    types (by default a dict should be the root type).
+    """
+    try:
+        data = msgpackutils.loads(raw_data)
+    except Exception as e:
+        # TODO(harlowja): fix this when msgpackutils exposes the msgpack
+        # exceptions so that we can avoid catching just exception...
+        raise ValueError("Expected msgpack decodable data: %s" % e)
+    else:
+        return _check_decoded_type(data, root_types=root_types)
 
 
 def decode_json(raw_data, root_types=(dict,)):
-    """Parse raw data to get JSON object.
+    """Parse raw data to get decoded object.
 
-    Decodes a JSON from a given raw data binary and checks that the root
-    type of that decoded object is in the allowed set of types (by
-    default a JSON object/dict should be the root type).
+    Decodes a JSON encoded 'blob' from a given raw data binary string and
+    checks that the root type of that decoded object is in the allowed set of
+    types (by default a dict should be the root type).
     """
     try:
         data = jsonutils.loads(binary_decode(raw_data))
@@ -155,15 +339,12 @@ def decode_json(raw_data, root_types=(dict,)):
         raise ValueError("Expected UTF-8 decodable data: %s" % e)
     except ValueError as e:
         raise ValueError("Expected JSON decodable data: %s" % e)
-    if root_types and not isinstance(data, tuple(root_types)):
-        ok_types = ", ".join(str(t) for t in root_types)
-        raise ValueError("Expected (%s) root types not: %s"
-                         % (ok_types, type(data)))
-    return data
+    else:
+        return _check_decoded_type(data, root_types=root_types)
 
 
 class cachedproperty(object):
-    """A descriptor property that is only evaluated once..
+    """A *thread-safe* descriptor property that is only evaluated once.
 
     This caching descriptor can be placed on instance methods to translate
     those methods into properties that will be cached in the instance (avoiding
@@ -176,6 +357,7 @@ class cachedproperty(object):
     after the first call to 'get_thing' occurs.
     """
     def __init__(self, fget):
+        self._lock = threading.RLock()
         # If a name is provided (as an argument) then this will be the string
         # to place the cached attribute under if not then it will be the
         # function itself to be wrapped into a property.
@@ -205,19 +387,19 @@ class cachedproperty(object):
     def __get__(self, instance, owner):
         if instance is None:
             return self
-        try:
+        # Quick check to see if this already has been made (before acquiring
+        # the lock). This is safe to do since we don't allow deletion after
+        # being created.
+        if hasattr(instance, self._attr_name):
             return getattr(instance, self._attr_name)
-        except AttributeError:
-            value = self._fget(instance)
-            setattr(instance, self._attr_name, value)
-            return value
-
-
-def wallclock():
-    # NOTE(harlowja): made into a function so that this can be easily mocked
-    # out if we want to alter time related functionality (for testing
-    # purposes).
-    return time.time()
+        else:
+            with self._lock:
+                try:
+                    return getattr(instance, self._attr_name)
+                except AttributeError:
+                    value = self._fget(instance)
+                    setattr(instance, self._attr_name, value)
+                    return value
 
 
 def millis_to_datetime(milliseconds):
@@ -257,27 +439,9 @@ def sequence_minus(seq1, seq2):
     return result
 
 
-def item_from(container, index, name=None):
-    """Attempts to fetch a index/key from a given container."""
-    if index is None:
-        return container
-    try:
-        return container[index]
-    except (IndexError, KeyError, ValueError, TypeError):
-        # NOTE(harlowja): Perhaps the container is a dictionary-like object
-        # and that key does not exist (key error), or the container is a
-        # tuple/list and a non-numeric key is being requested (index error),
-        # or there was no container and an attempt to index into none/other
-        # unsubscriptable type is being requested (type error).
-        if name is None:
-            name = index
-        raise exc.NotFound("Unable to find %r in container %s"
-                           % (name, container))
-
-
 def get_duplicate_keys(iterable, key=None):
     if key is not None:
-        iterable = six.moves.map(key, iterable)
+        iterable = compat_map(key, iterable)
     keys = set()
     duplicates = set()
     for item in iterable:
@@ -285,67 +449,6 @@ def get_duplicate_keys(iterable, key=None):
             duplicates.add(item)
         keys.add(item)
     return duplicates
-
-
-# NOTE(imelnikov): we should not use str.isalpha or str.isdigit
-# as they are locale-dependant
-_ASCII_WORD_SYMBOLS = frozenset(string.ascii_letters + string.digits + '_')
-
-
-def is_valid_attribute_name(name, allow_self=False, allow_hidden=False):
-    """Checks that a string is a valid/invalid python attribute name."""
-    return all((
-        isinstance(name, six.string_types),
-        len(name) > 0,
-        (allow_self or not name.lower().startswith('self')),
-        (allow_hidden or not name.lower().startswith('_')),
-
-        # NOTE(imelnikov): keywords should be forbidden.
-        not keyword.iskeyword(name),
-
-        # See: http://docs.python.org/release/2.5.2/ref/grammar.txt
-        not (name[0] in string.digits),
-        all(symbol in _ASCII_WORD_SYMBOLS for symbol in name)
-    ))
-
-
-class AttrDict(dict):
-    """Dictionary subclass that allows for attribute based access.
-
-    This subclass allows for accessing a dictionaries keys and values by
-    accessing those keys as regular attributes. Keys that are not valid python
-    attribute names can not of course be acccessed/set (those keys must be
-    accessed/set by the traditional dictionary indexing operators instead).
-    """
-    NO_ATTRS = tuple(reflection.get_member_names(dict))
-
-    @classmethod
-    def _is_valid_attribute_name(cls, name):
-        if not is_valid_attribute_name(name):
-            return False
-        # Make the name just be a simple string in latin-1 encoding in python3.
-        if name in cls.NO_ATTRS:
-            return False
-        return True
-
-    def __init__(self, **kwargs):
-        for (k, v) in kwargs.items():
-            if not self._is_valid_attribute_name(k):
-                raise AttributeError("Invalid attribute name: '%s'" % (k))
-            self[k] = v
-
-    def __getattr__(self, name):
-        if not self._is_valid_attribute_name(name):
-            raise AttributeError("Invalid attribute name: '%s'" % (name))
-        try:
-            return self[name]
-        except KeyError:
-            raise AttributeError("No attributed named: '%s'" % (name))
-
-    def __setattr__(self, name, value):
-        if not self._is_valid_attribute_name(name):
-            raise AttributeError("Invalid attribute name: '%s'" % (name))
-        self[name] = value
 
 
 class ExponentialBackoff(object):
@@ -364,7 +467,7 @@ class ExponentialBackoff(object):
     def __iter__(self):
         if self.count <= 0:
             raise StopIteration()
-        for i in six.moves.range(0, self.count):
+        for i in compat_range(0, self.count):
             yield min(self.exponent ** i, self.max_backoff)
 
     def __str__(self):
@@ -385,7 +488,8 @@ def as_int(obj, quiet=False):
         pass
     # Eck, not sure what this is then.
     if not quiet:
-        raise TypeError("Can not translate %s to an integer." % (obj))
+        raise TypeError("Can not translate '%s' (%s) to an integer"
+                        % (obj, type(obj)))
     return obj
 
 
@@ -399,143 +503,27 @@ def ensure_tree(path):
     """
     try:
         os.makedirs(path)
-    except OSError as exc:
-        if exc.errno == errno.EEXIST:
+    except OSError as e:
+        if e.errno == errno.EEXIST:
             if not os.path.isdir(path):
                 raise
         else:
             raise
 
 
-class Notifier(object):
-    """A notification helper class.
-
-    It is intended to be used to subscribe to notifications of events
-    occurring as well as allow a entity to post said notifications to any
-    associated subscribers without having either entity care about how this
-    notification occurs.
-    """
-
-    RESERVED_KEYS = ('details',)
-    ANY = '*'
-
-    def __init__(self):
-        self._listeners = collections.defaultdict(list)
-
-    def __len__(self):
-        """Returns how many callbacks are registered."""
-        count = 0
-        for (_event_type, callbacks) in six.iteritems(self._listeners):
-            count += len(callbacks)
-        return count
-
-    def is_registered(self, event_type, callback):
-        """Check if a callback is registered."""
-        listeners = list(self._listeners.get(event_type, []))
-        for (cb, _args, _kwargs) in listeners:
-            if reflection.is_same_callback(cb, callback):
-                return True
-        return False
-
-    def reset(self):
-        """Forget all previously registered callbacks."""
-        self._listeners.clear()
-
-    def notify(self, event_type, details):
-        """Notify about event occurrence.
-
-        All callbacks registered to receive notifications about given
-        event type will be called.
-
-        :param event_type: event type that occurred
-        :param details: addition event details
-        """
-        listeners = list(self._listeners.get(self.ANY, []))
-        for i in self._listeners[event_type]:
-            if i not in listeners:
-                listeners.append(i)
-        if not listeners:
-            return
-        for (callback, args, kwargs) in listeners:
-            if args is None:
-                args = []
-            if kwargs is None:
-                kwargs = {}
-            kwargs['details'] = details
-            try:
-                callback(event_type, *args, **kwargs)
-            except Exception:
-                LOG.warn("Failure calling callback %s to notify about event"
-                         " %s, details: %s", callback, event_type,
-                         details, exc_info=True)
-
-    def register(self, event_type, callback, args=None, kwargs=None):
-        """Register a callback to be called when event of a given type occurs.
-
-        Callback will be called with provided ``args`` and ``kwargs`` and
-        when event type occurs (or on any event if ``event_type`` equals to
-        ``Notifier.ANY``). It will also get additional keyword argument,
-        ``details``, that will hold event details provided to
-        :py:meth:`notify` method.
-        """
-        assert six.callable(callback), "Callback must be callable"
-        if self.is_registered(event_type, callback):
-            raise ValueError("Callback %s already registered" % (callback))
-        if kwargs:
-            for k in self.RESERVED_KEYS:
-                if k in kwargs:
-                    raise KeyError(("Reserved key '%s' not allowed in "
-                                    "kwargs") % k)
-            kwargs = copy.copy(kwargs)
-        if args:
-            args = copy.copy(args)
-        self._listeners[event_type].append((callback, args, kwargs))
-
-    def deregister(self, event_type, callback):
-        """Remove a single callback from listening to event ``event_type``."""
-        if event_type not in self._listeners:
-            return
-        for i, (cb, args, kwargs) in enumerate(self._listeners[event_type]):
-            if reflection.is_same_callback(cb, callback):
-                self._listeners[event_type].pop(i)
-                break
+Failure = deprecation.moved_proxy_class(failure.Failure,
+                                        'Failure', __name__,
+                                        version="0.6", removal_version="2.0")
 
 
-def copy_exc_info(exc_info):
-    """Make copy of exception info tuple, as deep as possible."""
-    if exc_info is None:
-        return None
-    exc_type, exc_value, tb = exc_info
-    # NOTE(imelnikov): there is no need to copy type, and
-    # we can't copy traceback.
-    return (exc_type, copy.deepcopy(exc_value), tb)
-
-
-def are_equal_exc_info_tuples(ei1, ei2):
-    if ei1 == ei2:
-        return True
-    if ei1 is None or ei2 is None:
-        return False  # if both are None, we returned True above
-
-    # NOTE(imelnikov): we can't compare exceptions with '=='
-    # because we want exc_info be equal to it's copy made with
-    # copy_exc_info above.
-    if ei1[0] is not ei2[0]:
-        return False
-    if not all((type(ei1[1]) == type(ei2[1]),
-                exc.exception_message(ei1[1]) == exc.exception_message(ei2[1]),
-                repr(ei1[1]) == repr(ei2[1]))):
-        return False
-    if ei1[2] == ei2[2]:
-        return True
-    tb1 = traceback.format_tb(ei1[2])
-    tb2 = traceback.format_tb(ei2[2])
-    return tb1 == tb2
+Notifier = deprecation.moved_proxy_class(notifier.Notifier,
+                                         'Notifier', __name__,
+                                         version="0.6", removal_version="2.0")
 
 
 @contextlib.contextmanager
 def capture_failure():
-    """Captures the occuring exception and provides a failure back.
+    """Captures the occurring exception and provides a failure object back.
 
     This will save the current exception information and yield back a
     failure object for the caller to use (it will raise a runtime error if
@@ -552,177 +540,44 @@ def capture_failure():
 
     For example::
 
-      except Exception:
-        with capture_failure() as fail:
-            LOG.warn("Activating cleanup")
-            cleanup()
-            save_failure(fail)
+        >>> from taskflow.utils import misc
+        >>>
+        >>> def cleanup():
+        ...     pass
+        ...
+        >>>
+        >>> def save_failure(f):
+        ...     print("Saving %s" % f)
+        ...
+        >>>
+        >>> try:
+        ...     raise IOError("Broken")
+        ... except Exception:
+        ...     with misc.capture_failure() as fail:
+        ...         print("Activating cleanup")
+        ...         cleanup()
+        ...         save_failure(fail)
+        ...
+        Activating cleanup
+        Saving Failure: IOError: Broken
+
     """
     exc_info = sys.exc_info()
     if not any(exc_info):
         raise RuntimeError("No active exception is being handled")
     else:
-        yield Failure(exc_info=exc_info)
+        yield failure.Failure(exc_info=exc_info)
 
 
-class Failure(object):
-    """Object that represents failure.
+def is_iterable(obj):
+    """Tests an object to to determine whether it is iterable.
 
-    Failure objects encapsulate exception information so that
-    it can be re-used later to re-raise or inspect.
+    This function will test the specified object to determine whether it is
+    iterable. String types (both ``str`` and ``unicode``) are ignored and will
+    return False.
+
+    :param obj: object to be tested for iterable
+    :return: True if object is iterable and is not a string
     """
-    DICT_VERSION = 1
-
-    def __init__(self, exc_info=None, **kwargs):
-        if not kwargs:
-            if exc_info is None:
-                exc_info = sys.exc_info()
-            self._exc_info = exc_info
-            self._exc_type_names = list(
-                reflection.get_all_class_names(exc_info[0], up_to=Exception))
-            if not self._exc_type_names:
-                raise TypeError('Invalid exception type: %r' % exc_info[0])
-            self._exception_str = exc.exception_message(self._exc_info[1])
-            self._traceback_str = ''.join(
-                traceback.format_tb(self._exc_info[2]))
-        else:
-            self._exc_info = exc_info  # may be None
-            self._exception_str = kwargs.pop('exception_str')
-            self._exc_type_names = kwargs.pop('exc_type_names', [])
-            self._traceback_str = kwargs.pop('traceback_str', None)
-            if kwargs:
-                raise TypeError(
-                    'Failure.__init__ got unexpected keyword argument(s): %s'
-                    % ', '.join(six.iterkeys(kwargs)))
-
-    @classmethod
-    def from_exception(cls, exception):
-        return cls((type(exception), exception, None))
-
-    def _matches(self, other):
-        if self is other:
-            return True
-        return (self._exc_type_names == other._exc_type_names
-                and self.exception_str == other.exception_str
-                and self.traceback_str == other.traceback_str)
-
-    def matches(self, other):
-        if not isinstance(other, Failure):
-            return False
-        if self.exc_info is None or other.exc_info is None:
-            return self._matches(other)
-        else:
-            return self == other
-
-    def __eq__(self, other):
-        if not isinstance(other, Failure):
-            return NotImplemented
-        return (self._matches(other) and
-                are_equal_exc_info_tuples(self.exc_info, other.exc_info))
-
-    def __ne__(self, other):
-        return not (self == other)
-
-    # NOTE(imelnikov): obj.__hash__() should return same values for equal
-    # objects, so we should redefine __hash__. Failure equality semantics
-    # is a bit complicated, so for now we just mark Failure objects as
-    # unhashable. See python docs on object.__hash__  for more info:
-    # http://docs.python.org/2/reference/datamodel.html#object.__hash__
-    __hash__ = None
-
-    @property
-    def exception(self):
-        """Exception value, or None if exception value is not present.
-
-        Exception value may be lost during serialization.
-        """
-        if self._exc_info:
-            return self._exc_info[1]
-        else:
-            return None
-
-    @property
-    def exception_str(self):
-        """String representation of exception."""
-        return self._exception_str
-
-    @property
-    def exc_info(self):
-        """Exception info tuple or None."""
-        return self._exc_info
-
-    @property
-    def traceback_str(self):
-        """Exception traceback as string."""
-        return self._traceback_str
-
-    @staticmethod
-    def reraise_if_any(failures):
-        """Re-raise exceptions if argument is not empty.
-
-        If argument is empty list, this method returns None. If
-        argument is list with single Failure object in it,
-        this failure is reraised. Else, WrappedFailure exception
-        is raised with failures list as causes.
-        """
-        failures = list(failures)
-        if len(failures) == 1:
-            failures[0].reraise()
-        elif len(failures) > 1:
-            raise exc.WrappedFailure(failures)
-
-    def reraise(self):
-        """Re-raise captured exception."""
-        if self._exc_info:
-            six.reraise(*self._exc_info)
-        else:
-            raise exc.WrappedFailure([self])
-
-    def check(self, *exc_classes):
-        """Check if any of exc_classes caused the failure.
-
-        Arguments of this method can be exception types or type
-        names (stings). If captured exception is instance of
-        exception of given type, the corresponding argument is
-        returned. Else, None is returned.
-        """
-        for cls in exc_classes:
-            if isinstance(cls, type):
-                err = reflection.get_class_name(cls)
-            else:
-                err = cls
-            if err in self._exc_type_names:
-                return cls
-        return None
-
-    def __str__(self):
-        return 'Failure: %s: %s' % (self._exc_type_names[0],
-                                    self._exception_str)
-
-    def __iter__(self):
-        """Iterate over exception type names."""
-        for et in self._exc_type_names:
-            yield et
-
-    @classmethod
-    def from_dict(cls, data):
-        data = dict(data)
-        version = data.pop('version', None)
-        if version != cls.DICT_VERSION:
-            raise ValueError('Invalid dict version of failure object: %r'
-                             % version)
-        return cls(**data)
-
-    def to_dict(self):
-        return {
-            'exception_str': self.exception_str,
-            'traceback_str': self.traceback_str,
-            'exc_type_names': list(self),
-            'version': self.DICT_VERSION,
-        }
-
-    def copy(self):
-        return Failure(exc_info=copy_exc_info(self.exc_info),
-                       exception_str=self.exception_str,
-                       traceback_str=self.traceback_str,
-                       exc_type_names=self._exc_type_names[:])
+    return (not isinstance(obj, six.string_types) and
+            isinstance(obj, collections.Iterable))

@@ -14,13 +14,80 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from concurrent import futures
-import mock
+import futurist
+from oslo_utils import uuidutils
 
+from taskflow.engines.action_engine import executor
 from taskflow.engines.worker_based import protocol as pr
+from taskflow import exceptions as excp
 from taskflow import test
+from taskflow.test import mock
 from taskflow.tests import utils
-from taskflow.utils import misc
+from taskflow.types import failure
+
+
+class TestProtocolValidation(test.TestCase):
+    def test_send_notify(self):
+        msg = pr.Notify()
+        pr.Notify.validate(msg.to_dict(), False)
+
+    def test_send_notify_invalid(self):
+        msg = {
+            'all your base': 'are belong to us',
+        }
+        self.assertRaises(excp.InvalidFormat,
+                          pr.Notify.validate, msg, False)
+
+    def test_reply_notify(self):
+        msg = pr.Notify(topic="bob", tasks=['a', 'b', 'c'])
+        pr.Notify.validate(msg.to_dict(), True)
+
+    def test_reply_notify_invalid(self):
+        msg = {
+            'topic': {},
+            'tasks': 'not yours',
+        }
+        self.assertRaises(excp.InvalidFormat,
+                          pr.Notify.validate, msg, True)
+
+    def test_request(self):
+        msg = pr.Request(utils.DummyTask("hi"), uuidutils.generate_uuid(),
+                         pr.EXECUTE, {}, 1.0)
+        pr.Request.validate(msg.to_dict())
+
+    def test_request_invalid(self):
+        msg = {
+            'task_name': 1,
+            'task_cls': False,
+            'arguments': [],
+        }
+        self.assertRaises(excp.InvalidFormat, pr.Request.validate, msg)
+
+    def test_request_invalid_action(self):
+        msg = pr.Request(utils.DummyTask("hi"), uuidutils.generate_uuid(),
+                         pr.EXECUTE, {}, 1.0)
+        msg = msg.to_dict()
+        msg['action'] = 'NOTHING'
+        self.assertRaises(excp.InvalidFormat, pr.Request.validate, msg)
+
+    def test_response_progress(self):
+        msg = pr.Response(pr.EVENT, details={'progress': 0.5},
+                          event_type='blah')
+        pr.Response.validate(msg.to_dict())
+
+    def test_response_completion(self):
+        msg = pr.Response(pr.SUCCESS, result=1)
+        pr.Response.validate(msg.to_dict())
+
+    def test_response_mixed_invalid(self):
+        msg = pr.Response(pr.EVENT,
+                          details={'progress': 0.5},
+                          event_type='blah', result=1)
+        self.assertRaises(excp.InvalidFormat, pr.Response.validate, msg)
+
+    def test_response_bad_state(self):
+        msg = pr.Response('STUFF')
+        self.assertRaises(excp.InvalidFormat, pr.Response.validate, msg)
 
 
 class TestProtocol(test.TestCase):
@@ -52,77 +119,74 @@ class TestProtocol(test.TestCase):
         to_dict.update(kwargs)
         return to_dict
 
+    def test_request_transitions(self):
+        request = self.request()
+        self.assertEqual(pr.WAITING, request.state)
+        self.assertIn(request.state, pr.WAITING_STATES)
+        self.assertRaises(excp.InvalidState, request.transition, pr.SUCCESS)
+        self.assertFalse(request.transition(pr.WAITING))
+        self.assertTrue(request.transition(pr.PENDING))
+        self.assertTrue(request.transition(pr.RUNNING))
+        self.assertTrue(request.transition(pr.SUCCESS))
+        for s in (pr.PENDING, pr.WAITING):
+            self.assertRaises(excp.InvalidState, request.transition, s)
+
     def test_creation(self):
         request = self.request()
-        self.assertEqual(request.uuid, self.task_uuid)
-        self.assertEqual(request.task_cls, self.task.name)
-        self.assertIsInstance(request.result, futures.Future)
+        self.assertEqual(self.task_uuid, request.uuid)
+        self.assertEqual(self.task, request.task)
+        self.assertIsInstance(request.result, futurist.Future)
         self.assertFalse(request.result.done())
 
-    def test_str(self):
-        request = self.request()
-        self.assertEqual(str(request),
-                         "<REQUEST> %s" % self.request_to_dict())
-
-    def test_repr(self):
-        expected = '%s:%s' % (self.task.name, self.task_action)
-        self.assertEqual(repr(self.request()), expected)
-
     def test_to_dict_default(self):
-        self.assertEqual(self.request().to_dict(), self.request_to_dict())
+        self.assertEqual(self.request_to_dict(), self.request().to_dict())
 
     def test_to_dict_with_result(self):
-        self.assertEqual(self.request(result=333).to_dict(),
-                         self.request_to_dict(result=('success', 333)))
+        self.assertEqual(self.request_to_dict(result=('success', 333)),
+                         self.request(result=333).to_dict())
 
     def test_to_dict_with_result_none(self):
-        self.assertEqual(self.request(result=None).to_dict(),
-                         self.request_to_dict(result=('success', None)))
+        self.assertEqual(self.request_to_dict(result=('success', None)),
+                         self.request(result=None).to_dict())
 
     def test_to_dict_with_result_failure(self):
-        failure = misc.Failure.from_exception(RuntimeError('Woot!'))
-        expected = self.request_to_dict(result=('failure', failure.to_dict()))
-        self.assertEqual(self.request(result=failure).to_dict(), expected)
+        a_failure = failure.Failure.from_exception(RuntimeError('Woot!'))
+        expected = self.request_to_dict(result=('failure',
+                                                a_failure.to_dict()))
+        self.assertEqual(expected, self.request(result=a_failure).to_dict())
 
     def test_to_dict_with_failures(self):
-        failure = misc.Failure.from_exception(RuntimeError('Woot!'))
-        request = self.request(failures={self.task.name: failure})
+        a_failure = failure.Failure.from_exception(RuntimeError('Woot!'))
+        request = self.request(failures={self.task.name: a_failure})
         expected = self.request_to_dict(
-            failures={self.task.name: failure.to_dict()})
-        self.assertEqual(request.to_dict(), expected)
+            failures={self.task.name: a_failure.to_dict()})
+        self.assertEqual(expected, request.to_dict())
 
-    @mock.patch('taskflow.engines.worker_based.protocol.misc.wallclock')
-    def test_pending_not_expired(self, mocked_wallclock):
-        mocked_wallclock.side_effect = [1, self.timeout]
-        self.assertFalse(self.request().expired)
+    @mock.patch('oslo_utils.timeutils.now')
+    def test_pending_not_expired(self, now):
+        now.return_value = 0
+        req = self.request()
+        now.return_value = self.timeout - 1
+        self.assertFalse(req.expired)
 
-    @mock.patch('taskflow.engines.worker_based.protocol.misc.wallclock')
-    def test_pending_expired(self, mocked_wallclock):
-        mocked_wallclock.side_effect = [1, self.timeout + 2]
-        self.assertTrue(self.request().expired)
+    @mock.patch('oslo_utils.timeutils.now')
+    def test_pending_expired(self, now):
+        now.return_value = 0
+        req = self.request()
+        now.return_value = self.timeout + 1
+        self.assertTrue(req.expired)
 
-    @mock.patch('taskflow.engines.worker_based.protocol.misc.wallclock')
-    def test_running_not_expired(self, mocked_wallclock):
-        mocked_wallclock.side_effect = [1, self.timeout + 2]
+    @mock.patch('oslo_utils.timeutils.now')
+    def test_running_not_expired(self, now):
+        now.return_value = 0
         request = self.request()
-        request.set_running()
+        request.transition(pr.PENDING)
+        request.transition(pr.RUNNING)
+        now.return_value = self.timeout + 1
         self.assertFalse(request.expired)
 
     def test_set_result(self):
         request = self.request()
         request.set_result(111)
         result = request.result.result()
-        self.assertEqual(result, (self.task, 'executed', 111))
-
-    def test_on_progress(self):
-        progress_callback = mock.MagicMock(name='progress_callback')
-        request = self.request(task=self.task,
-                               progress_callback=progress_callback)
-        request.on_progress('event_data', 0.0)
-        request.on_progress('event_data', 1.0)
-
-        expected_calls = [
-            mock.call(self.task, 'event_data', 0.0),
-            mock.call(self.task, 'event_data', 1.0)
-        ]
-        self.assertEqual(progress_callback.mock_calls, expected_calls)
+        self.assertEqual((executor.EXECUTED, 111), result)

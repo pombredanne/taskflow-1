@@ -14,13 +14,14 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from oslo_utils import reflection
+import six
 
 from taskflow.engines.worker_based import endpoint
 from taskflow.engines.worker_based import worker
 from taskflow import test
+from taskflow.test import mock
 from taskflow.tests import utils
-from taskflow.utils import reflection
 
 
 class TestWorker(test.MockTestCase):
@@ -32,19 +33,13 @@ class TestWorker(test.MockTestCase):
         self.broker_url = 'test-url'
         self.exchange = 'test-exchange'
         self.topic = 'test-topic'
-        self.threads_count = 5
-        self.endpoint_count = 21
+        self.endpoint_count = 26
 
         # patch classes
-        self.executor_mock, self.executor_inst_mock = self._patch_class(
-            worker.futures, 'ThreadPoolExecutor', attach_as='executor')
-        self.server_mock, self.server_inst_mock = self._patch_class(
+        self.executor_mock, self.executor_inst_mock = self.patchClass(
+            worker.futurist, 'ThreadPoolExecutor', attach_as='executor')
+        self.server_mock, self.server_inst_mock = self.patchClass(
             worker.server, 'Server')
-
-        # other mocking
-        self.threads_count_mock = self._patch(
-            'taskflow.engines.worker_based.worker.tu.get_optimal_thread_count')
-        self.threads_count_mock.return_value = self.threads_count
 
     def worker(self, reset_master_mock=False, **kwargs):
         worker_kwargs = dict(exchange=self.exchange,
@@ -54,31 +49,44 @@ class TestWorker(test.MockTestCase):
         worker_kwargs.update(kwargs)
         w = worker.Worker(**worker_kwargs)
         if reset_master_mock:
-            self._reset_master_mock()
+            self.resetMasterMock()
         return w
 
     def test_creation(self):
         self.worker()
 
         master_mock_calls = [
-            mock.call.executor_class(self.threads_count),
+            mock.call.executor_class(max_workers=None),
             mock.call.Server(self.topic, self.exchange,
-                             self.executor_inst_mock, [], url=self.broker_url)
+                             self.executor_inst_mock, [],
+                             url=self.broker_url,
+                             transport_options=mock.ANY,
+                             transport=mock.ANY,
+                             retry_options=mock.ANY)
         ]
-        self.assertEqual(self.master_mock.mock_calls, master_mock_calls)
+        self.assertEqual(master_mock_calls, self.master_mock.mock_calls)
+
+    def test_banner_writing(self):
+        buf = six.StringIO()
+        w = self.worker()
+        w.run(banner_writer=buf.write)
+        w.wait()
+        w.stop()
+        self.assertGreater(0, len(buf.getvalue()))
 
     def test_creation_with_custom_threads_count(self):
         self.worker(threads_count=10)
 
         master_mock_calls = [
-            mock.call.executor_class(10),
+            mock.call.executor_class(max_workers=10),
             mock.call.Server(self.topic, self.exchange,
-                             self.executor_inst_mock, [], url=self.broker_url)
+                             self.executor_inst_mock, [],
+                             url=self.broker_url,
+                             transport_options=mock.ANY,
+                             transport=mock.ANY,
+                             retry_options=mock.ANY)
         ]
-        self.assertEqual(self.master_mock.mock_calls, master_mock_calls)
-
-    def test_creation_with_negative_threads_count(self):
-        self.assertRaises(ValueError, self.worker, threads_count=-10)
+        self.assertEqual(master_mock_calls, self.master_mock.mock_calls)
 
     def test_creation_with_custom_executor(self):
         executor_mock = mock.MagicMock(name='executor')
@@ -86,9 +94,12 @@ class TestWorker(test.MockTestCase):
 
         master_mock_calls = [
             mock.call.Server(self.topic, self.exchange, executor_mock, [],
-                             url=self.broker_url)
+                             url=self.broker_url,
+                             transport_options=mock.ANY,
+                             transport=mock.ANY,
+                             retry_options=mock.ANY)
         ]
-        self.assertEqual(self.master_mock.mock_calls, master_mock_calls)
+        self.assertEqual(master_mock_calls, self.master_mock.mock_calls)
 
     def test_run_with_no_tasks(self):
         self.worker(reset_master_mock=True).run()
@@ -96,7 +107,7 @@ class TestWorker(test.MockTestCase):
         master_mock_calls = [
             mock.call.server.start()
         ]
-        self.assertEqual(self.master_mock.mock_calls, master_mock_calls)
+        self.assertEqual(master_mock_calls, self.master_mock.mock_calls)
 
     def test_run_with_tasks(self):
         self.worker(reset_master_mock=True,
@@ -105,7 +116,7 @@ class TestWorker(test.MockTestCase):
         master_mock_calls = [
             mock.call.server.start()
         ]
-        self.assertEqual(self.master_mock.mock_calls, master_mock_calls)
+        self.assertEqual(master_mock_calls, self.master_mock.mock_calls)
 
     def test_run_with_custom_executor(self):
         executor_mock = mock.MagicMock(name='executor')
@@ -115,7 +126,7 @@ class TestWorker(test.MockTestCase):
         master_mock_calls = [
             mock.call.server.start()
         ]
-        self.assertEqual(self.master_mock.mock_calls, master_mock_calls)
+        self.assertEqual(master_mock_calls, self.master_mock.mock_calls)
 
     def test_wait(self):
         w = self.worker(reset_master_mock=True)
@@ -126,7 +137,7 @@ class TestWorker(test.MockTestCase):
             mock.call.server.start(),
             mock.call.server.wait()
         ]
-        self.assertEqual(self.master_mock.mock_calls, master_mock_calls)
+        self.assertEqual(master_mock_calls, self.master_mock.mock_calls)
 
     def test_stop(self):
         self.worker(reset_master_mock=True).stop()
@@ -135,20 +146,20 @@ class TestWorker(test.MockTestCase):
             mock.call.server.stop(),
             mock.call.executor.shutdown()
         ]
-        self.assertEqual(self.master_mock.mock_calls, master_mock_calls)
+        self.assertEqual(master_mock_calls, self.master_mock.mock_calls)
 
     def test_derive_endpoints_from_string_tasks(self):
         endpoints = worker.Worker._derive_endpoints(
             ['taskflow.tests.utils:DummyTask'])
 
-        self.assertEqual(len(endpoints), 1)
+        self.assertEqual(1, len(endpoints))
         self.assertIsInstance(endpoints[0], endpoint.Endpoint)
-        self.assertEqual(endpoints[0].name, self.task_name)
+        self.assertEqual(self.task_name, endpoints[0].name)
 
     def test_derive_endpoints_from_string_modules(self):
         endpoints = worker.Worker._derive_endpoints(['taskflow.tests.utils'])
 
-        self.assertEqual(len(endpoints), self.endpoint_count)
+        self.assertEqual(self.endpoint_count, len(endpoints))
 
     def test_derive_endpoints_from_string_non_existent_module(self):
         tasks = ['non.existent.module']
@@ -168,9 +179,9 @@ class TestWorker(test.MockTestCase):
     def test_derive_endpoints_from_tasks(self):
         endpoints = worker.Worker._derive_endpoints([self.task_cls])
 
-        self.assertEqual(len(endpoints), 1)
+        self.assertEqual(1, len(endpoints))
         self.assertIsInstance(endpoints[0], endpoint.Endpoint)
-        self.assertEqual(endpoints[0].name, self.task_name)
+        self.assertEqual(self.task_name, endpoints[0].name)
 
     def test_derive_endpoints_from_non_task_class(self):
         self.assertRaises(TypeError, worker.Worker._derive_endpoints,
@@ -179,7 +190,7 @@ class TestWorker(test.MockTestCase):
     def test_derive_endpoints_from_modules(self):
         endpoints = worker.Worker._derive_endpoints([utils])
 
-        self.assertEqual(len(endpoints), self.endpoint_count)
+        self.assertEqual(self.endpoint_count, len(endpoints))
 
     def test_derive_endpoints_unexpected_task_type(self):
         self.assertRaises(TypeError, worker.Worker._derive_endpoints, [111])

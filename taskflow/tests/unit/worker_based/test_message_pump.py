@@ -16,42 +16,41 @@
 
 import threading
 
-import mock
+from oslo_utils import uuidutils
 
+from taskflow.engines.worker_based import dispatcher
 from taskflow.engines.worker_based import protocol as pr
 from taskflow.engines.worker_based import proxy
-from taskflow.openstack.common import uuidutils
 from taskflow import test
+from taskflow.test import mock
 from taskflow.tests import utils as test_utils
 from taskflow.types import latch
+from taskflow.utils import threading_utils
 
 TEST_EXCHANGE, TEST_TOPIC = ('test-exchange', 'test-topic')
-BARRIER_WAIT_TIMEOUT = 1.0
 POLLING_INTERVAL = 0.01
 
 
-class TestMessagePump(test.MockTestCase):
+class TestMessagePump(test.TestCase):
     def test_notify(self):
         barrier = threading.Event()
 
         on_notify = mock.MagicMock()
         on_notify.side_effect = lambda *args, **kwargs: barrier.set()
 
-        handlers = {pr.NOTIFY: on_notify}
+        handlers = {pr.NOTIFY: dispatcher.Handler(on_notify)}
         p = proxy.Proxy(TEST_TOPIC, TEST_EXCHANGE, handlers,
                         transport='memory',
                         transport_options={
                             'polling_interval': POLLING_INTERVAL,
                         })
 
-        t = threading.Thread(target=p.start)
-        t.daemon = True
+        t = threading_utils.daemon_thread(p.start)
         t.start()
         p.wait()
         p.publish(pr.Notify(), TEST_TOPIC)
 
-        barrier.wait(BARRIER_WAIT_TIMEOUT)
-        self.assertTrue(barrier.is_set())
+        self.assertTrue(barrier.wait(test_utils.WAIT_TIMEOUT))
         p.stop()
         t.join()
 
@@ -64,21 +63,20 @@ class TestMessagePump(test.MockTestCase):
         on_response = mock.MagicMock()
         on_response.side_effect = lambda *args, **kwargs: barrier.set()
 
-        handlers = {pr.RESPONSE: on_response}
+        handlers = {pr.RESPONSE: dispatcher.Handler(on_response)}
         p = proxy.Proxy(TEST_TOPIC, TEST_EXCHANGE, handlers,
                         transport='memory',
                         transport_options={
                             'polling_interval': POLLING_INTERVAL,
                         })
 
-        t = threading.Thread(target=p.start)
-        t.daemon = True
+        t = threading_utils.daemon_thread(p.start)
         t.start()
         p.wait()
         resp = pr.Response(pr.RUNNING)
         p.publish(resp, TEST_TOPIC)
 
-        barrier.wait(BARRIER_WAIT_TIMEOUT)
+        self.assertTrue(barrier.wait(test_utils.WAIT_TIMEOUT))
         self.assertTrue(barrier.is_set())
         p.stop()
         t.join()
@@ -101,9 +99,9 @@ class TestMessagePump(test.MockTestCase):
         on_request.side_effect = countdown
 
         handlers = {
-            pr.NOTIFY: on_notify,
-            pr.RESPONSE: on_response,
-            pr.REQUEST: on_request,
+            pr.NOTIFY: dispatcher.Handler(on_notify),
+            pr.RESPONSE: dispatcher.Handler(on_response),
+            pr.REQUEST: dispatcher.Handler(on_request),
         }
         p = proxy.Proxy(TEST_TOPIC, TEST_EXCHANGE, handlers,
                         transport='memory',
@@ -111,8 +109,7 @@ class TestMessagePump(test.MockTestCase):
                             'polling_interval': POLLING_INTERVAL,
                         })
 
-        t = threading.Thread(target=p.start)
-        t.daemon = True
+        t = threading_utils.daemon_thread(p.start)
         t.start()
         p.wait()
 
@@ -125,9 +122,9 @@ class TestMessagePump(test.MockTestCase):
             else:
                 p.publish(pr.Request(test_utils.DummyTask("dummy_%s" % i),
                                      uuidutils.generate_uuid(),
-                                     pr.EXECUTE, [], None, None), TEST_TOPIC)
+                                     pr.EXECUTE, [], None), TEST_TOPIC)
 
-        barrier.wait(BARRIER_WAIT_TIMEOUT)
+        self.assertTrue(barrier.wait(test_utils.WAIT_TIMEOUT))
         self.assertEqual(0, barrier.needed)
         p.stop()
         t.join()

@@ -15,17 +15,20 @@
 #    under the License.
 
 import abc
+import collections
+import threading
 
-from concurrent import futures
-import jsonschema
-from jsonschema import exceptions as schema_exc
+import fasteners
+import futurist
+from oslo_utils import reflection
+from oslo_utils import timeutils
 import six
 
 from taskflow.engines.action_engine import executor
 from taskflow import exceptions as excp
-from taskflow.types import timing as tt
-from taskflow.utils import misc
-from taskflow.utils import reflection
+from taskflow import logging
+from taskflow.types import failure as ft
+from taskflow.utils import schema_utils as su
 
 # NOTE(skudriashev): This is protocol states and events, which are not
 # related to task states.
@@ -34,9 +37,36 @@ PENDING = 'PENDING'
 RUNNING = 'RUNNING'
 SUCCESS = 'SUCCESS'
 FAILURE = 'FAILURE'
-PROGRESS = 'PROGRESS'
+EVENT = 'EVENT'
 
-_ALL_STATES = (WAITING, PENDING, RUNNING, SUCCESS, FAILURE, PROGRESS)
+# During these states the expiry is active (once out of these states the expiry
+# no longer matters, since we have no way of knowing how long a task will run
+# for).
+WAITING_STATES = (WAITING, PENDING)
+
+_ALL_STATES = (WAITING, PENDING, RUNNING, SUCCESS, FAILURE, EVENT)
+_STOP_TIMER_STATES = (RUNNING, SUCCESS, FAILURE)
+
+# Transitions that a request state can go through.
+_ALLOWED_TRANSITIONS = (
+    # Used when a executor starts to publish a request to a selected worker.
+    (WAITING, PENDING),
+    # When a request expires (isn't able to be processed by any worker).
+    (WAITING, FAILURE),
+    # Worker has started executing a request.
+    (PENDING, RUNNING),
+    # Worker failed to construct/process a request to run (either the worker
+    # did not transition to RUNNING in the given timeout or the worker itself
+    # had some type of failure before RUNNING started).
+    #
+    # Also used by the executor if the request was attempted to be published
+    # but that did publishing process did not work out.
+    (PENDING, FAILURE),
+    # Execution failed due to some type of remote failure.
+    (RUNNING, FAILURE),
+    # Execution succeeded & has completed.
+    (RUNNING, SUCCESS),
+)
 
 # Remote task actions.
 EXECUTE = 'execute'
@@ -67,19 +97,17 @@ NOTIFY = 'NOTIFY'
 REQUEST = 'REQUEST'
 RESPONSE = 'RESPONSE'
 
-# Special jsonschema validation types/adjustments.
-_SCHEMA_TYPES = {
-    # See: https://github.com/Julian/jsonschema/issues/148
-    'array': (list, tuple),
-}
+LOG = logging.getLogger(__name__)
 
 
 @six.add_metaclass(abc.ABCMeta)
 class Message(object):
     """Base class for all message types."""
 
-    def __str__(self):
-        return "<%s> %s" % (self.TYPE, self.to_dict())
+    def __repr__(self):
+        return ("<%s object at 0x%x with contents %s>"
+                % (reflection.get_class_name(self, fully_qualified=False),
+                   id(self), self.to_dict()))
 
     @abc.abstractmethod
     def to_dict(self):
@@ -88,12 +116,16 @@ class Message(object):
 
 class Notify(Message):
     """Represents notify message type."""
+
+    #: String constant representing this message type.
     TYPE = NOTIFY
 
     # NOTE(harlowja): the executor (the entity who initially requests a worker
     # to send back a notification response) schema is different than the
     # worker response schema (that's why there are two schemas here).
-    _RESPONSE_SCHEMA = {
+
+    #: Expected notify *response* message schema (in json schema format).
+    RESPONSE_SCHEMA = {
         "type": "object",
         'properties': {
             'topic': {
@@ -109,7 +141,9 @@ class Notify(Message):
         "required": ["topic", 'tasks'],
         "additionalProperties": False,
     }
-    _SENDER_SCHEMA = {
+
+    #: Expected *sender* request message schema (in json schema format).
+    SENDER_SCHEMA = {
         "type": "object",
         "additionalProperties": False,
     }
@@ -117,36 +151,58 @@ class Notify(Message):
     def __init__(self, **data):
         self._data = data
 
+    @property
+    def topic(self):
+        return self._data.get('topic')
+
+    @property
+    def tasks(self):
+        return self._data.get('tasks')
+
     def to_dict(self):
         return self._data
 
     @classmethod
     def validate(cls, data, response):
         if response:
-            schema = cls._RESPONSE_SCHEMA
+            schema = cls.RESPONSE_SCHEMA
         else:
-            schema = cls._SENDER_SCHEMA
+            schema = cls.SENDER_SCHEMA
         try:
-            jsonschema.validate(data, schema, types=_SCHEMA_TYPES)
-        except schema_exc.ValidationError as e:
+            su.schema_validate(data, schema)
+        except su.ValidationError as e:
+            cls_name = reflection.get_class_name(cls, fully_qualified=False)
             if response:
-                raise excp.InvalidFormat("%s message response data not of the"
-                                         " expected format: %s"
-                                         % (cls.TYPE, e.message), e)
+                excp.raise_with_cause(excp.InvalidFormat,
+                                      "%s message response data not of the"
+                                      " expected format: %s" % (cls_name,
+                                                                e.message),
+                                      cause=e)
             else:
-                raise excp.InvalidFormat("%s message sender data not of the"
-                                         " expected format: %s"
-                                         % (cls.TYPE, e.message), e)
+                excp.raise_with_cause(excp.InvalidFormat,
+                                      "%s message sender data not of the"
+                                      " expected format: %s" % (cls_name,
+                                                                e.message),
+                                      cause=e)
+
+
+_WorkUnit = collections.namedtuple('_WorkUnit', ['task_cls', 'task_name',
+                                                 'action', 'arguments'])
 
 
 class Request(Message):
     """Represents request with execution results.
 
     Every request is created in the WAITING state and is expired within the
-    given timeout.
+    given timeout if it does not transition out of the (WAITING, PENDING)
+    states.
     """
+
+    #: String constant representing this message type.
     TYPE = REQUEST
-    _SCHEMA = {
+
+    #: Expected message schema (in json schema format).
+    SCHEMA = {
         "type": "object",
         'properties': {
             # These two are typically only sent on revert actions (that is
@@ -184,34 +240,44 @@ class Request(Message):
         'required': ['task_cls', 'task_name', 'task_version', 'action'],
     }
 
-    def __init__(self, task, uuid, action, arguments, progress_callback,
-                 timeout, **kwargs):
+    def __init__(self, task, uuid, action, arguments, timeout, **kwargs):
         self._task = task
-        self._task_cls = reflection.get_class_name(task)
         self._uuid = uuid
         self._action = action
         self._event = ACTION_TO_EVENT[action]
         self._arguments = arguments
-        self._progress_callback = progress_callback
         self._kwargs = kwargs
-        self._watch = tt.StopWatch(duration=timeout).start()
+        self._watch = timeutils.StopWatch(duration=timeout).start()
         self._state = WAITING
-        self.result = futures.Future()
+        self._lock = threading.Lock()
+        self._created_on = timeutils.utcnow()
+        self._result = futurist.Future()
+        self._result.atom = task
+        self._notifier = task.notifier
 
-    def __repr__(self):
-        return "%s:%s" % (self._task_cls, self._action)
+    @property
+    def result(self):
+        return self._result
+
+    @property
+    def notifier(self):
+        return self._notifier
 
     @property
     def uuid(self):
         return self._uuid
 
     @property
-    def task_cls(self):
-        return self._task_cls
+    def task(self):
+        return self._task
 
     @property
     def state(self):
         return self._state
+
+    @property
+    def created_on(self):
+        return self._created_on
 
     @property
     def expired(self):
@@ -224,7 +290,7 @@ class Request(Message):
         state for more then the given timeout (it is not considered to be
         expired in any other state).
         """
-        if self._state in (WAITING, PENDING):
+        if self._state in WAITING_STATES:
             return self._watch.expired()
         return False
 
@@ -232,15 +298,19 @@ class Request(Message):
         """Return json-serializable request.
 
         To convert requests that have failed due to some exception this will
-        convert all `misc.Failure` objects into dictionaries (which will then
-        be reconstituted by the receiver).
+        convert all `failure.Failure` objects into dictionaries (which will
+        then be reconstituted by the receiver).
         """
-        request = dict(task_cls=self._task_cls, task_name=self._task.name,
-                       task_version=self._task.version, action=self._action,
-                       arguments=self._arguments)
+        request = {
+            'task_cls': reflection.get_class_name(self._task),
+            'task_name': self._task.name,
+            'task_version': self._task.version,
+            'action': self._action,
+            'arguments': self._arguments,
+        }
         if 'result' in self._kwargs:
             result = self._kwargs['result']
-            if isinstance(result, misc.Failure):
+            if isinstance(result, ft.Failure):
                 request['result'] = ('failure', result.to_dict())
             else:
                 request['result'] = ('success', result)
@@ -252,32 +322,118 @@ class Request(Message):
         return request
 
     def set_result(self, result):
-        self.result.set_result((self._task, self._event, result))
+        self.result.set_result((self._event, result))
 
-    def set_pending(self):
-        self._state = PENDING
+    def transition_and_log_error(self, new_state, logger=None):
+        """Transitions *and* logs an error if that transitioning raises.
 
-    def set_running(self):
-        self._state = RUNNING
-        self._watch.stop()
+        This overlays the transition function and performs nearly the same
+        functionality but instead of raising if the transition was not valid
+        it logs a warning to the provided logger and returns False to
+        indicate that the transition was not performed (note that this
+        is *different* from the transition function where False means
+        ignored).
+        """
+        if logger is None:
+            logger = LOG
+        moved = False
+        try:
+            moved = self.transition(new_state)
+        except excp.InvalidState:
+            logger.warn("Failed to transition '%s' to %s state.", self,
+                        new_state, exc_info=True)
+        return moved
 
-    def on_progress(self, event_data, progress):
-        self._progress_callback(self._task, event_data, progress)
+    @fasteners.locked
+    def transition(self, new_state):
+        """Transitions the request to a new state.
+
+        If transition was performed, it returns True. If transition
+        should was ignored, it returns False. If transition was not
+        valid (and will not be performed), it raises an InvalidState
+        exception.
+        """
+        old_state = self._state
+        if old_state == new_state:
+            return False
+        pair = (old_state, new_state)
+        if pair not in _ALLOWED_TRANSITIONS:
+            raise excp.InvalidState("Request transition from %s to %s is"
+                                    " not allowed" % pair)
+        if new_state in _STOP_TIMER_STATES:
+            self._watch.stop()
+        self._state = new_state
+        LOG.debug("Transitioned '%s' from %s state to %s state", self,
+                  old_state, new_state)
+        return True
 
     @classmethod
     def validate(cls, data):
         try:
-            jsonschema.validate(data, cls._SCHEMA, types=_SCHEMA_TYPES)
-        except schema_exc.ValidationError as e:
-            raise excp.InvalidFormat("%s message response data not of the"
-                                     " expected format: %s"
-                                     % (cls.TYPE, e.message), e)
+            su.schema_validate(data, cls.SCHEMA)
+        except su.ValidationError as e:
+            cls_name = reflection.get_class_name(cls, fully_qualified=False)
+            excp.raise_with_cause(excp.InvalidFormat,
+                                  "%s message response data not of the"
+                                  " expected format: %s" % (cls_name,
+                                                            e.message),
+                                  cause=e)
+        else:
+            # Validate all failure dictionaries that *may* be present...
+            failures = []
+            if 'failures' in data:
+                failures.extend(six.itervalues(data['failures']))
+            result = data.get('result')
+            if result is not None:
+                result_data_type, result_data = result
+                if result_data_type == 'failure':
+                    failures.append(result_data)
+            for fail_data in failures:
+                ft.Failure.validate(fail_data)
+
+    @staticmethod
+    def from_dict(data, task_uuid=None):
+        """Parses **validated** data into a work unit.
+
+        All :py:class:`~taskflow.types.failure.Failure` objects that have been
+        converted to dict(s) on the remote side will now converted back
+        to py:class:`~taskflow.types.failure.Failure` objects.
+        """
+        task_cls = data['task_cls']
+        task_name = data['task_name']
+        action = data['action']
+        arguments = data.get('arguments', {})
+        result = data.get('result')
+        failures = data.get('failures')
+        # These arguments will eventually be given to the task executor
+        # so they need to be in a format it will accept (and using keyword
+        # argument names that it accepts)...
+        arguments = {
+            'arguments': arguments,
+        }
+        if task_uuid is not None:
+            arguments['task_uuid'] = task_uuid
+        if result is not None:
+            result_data_type, result_data = result
+            if result_data_type == 'failure':
+                arguments['result'] = ft.Failure.from_dict(result_data)
+            else:
+                arguments['result'] = result_data
+        if failures is not None:
+            arguments['failures'] = {}
+            for task, fail_data in six.iteritems(failures):
+                arguments['failures'][task] = ft.Failure.from_dict(fail_data)
+        return _WorkUnit(task_cls, task_name, action, arguments)
 
 
 class Response(Message):
     """Represents response message type."""
+
+    #: String constant representing this message type.
     TYPE = RESPONSE
-    _SCHEMA = {
+
+    #: Expected message schema (in json schema format).
+    SCHEMA = {
         "type": "object",
         'properties': {
             'state': {
@@ -287,10 +443,13 @@ class Response(Message):
             'data': {
                 "anyOf": [
                     {
-                        "$ref": "#/definitions/progress",
+                        "$ref": "#/definitions/event",
                     },
                     {
                         "$ref": "#/definitions/completion",
+                    },
+                    {
+                        "$ref": "#/definitions/empty",
                     },
                 ],
             },
@@ -298,17 +457,23 @@ class Response(Message):
         "required": ["state", 'data'],
         "additionalProperties": False,
         "definitions": {
-            "progress": {
+            "event": {
                 "type": "object",
                 "properties": {
-                    'progress': {
-                        'type': 'number',
+                    'event_type': {
+                        'type': 'string',
                     },
-                    'event_data': {
+                    'details': {
                         'type': 'object',
                     },
                 },
-                "required": ["progress", 'event_data'],
+                "required": ["event_type", 'details'],
+                "additionalProperties": False,
+            },
+            # Used when sending *only* request state changes (and no data is
+            # expected).
+            "empty": {
+                "type": "object",
                 "additionalProperties": False,
             },
             "completion": {
@@ -334,7 +499,7 @@ class Response(Message):
         state = data['state']
         data = data['data']
         if state == FAILURE and 'result' in data:
-            data['result'] = misc.Failure.from_dict(data['result'])
+            data['result'] = ft.Failure.from_dict(data['result'])
         return cls(state, **data)
 
     @property
@@ -351,8 +516,15 @@ class Response(Message):
     @classmethod
     def validate(cls, data):
         try:
-            jsonschema.validate(data, cls._SCHEMA, types=_SCHEMA_TYPES)
-        except schema_exc.ValidationError as e:
-            raise excp.InvalidFormat("%s message response data not of the"
-                                     " expected format: %s"
-                                     % (cls.TYPE, e.message), e)
+            su.schema_validate(data, cls.SCHEMA)
+        except su.ValidationError as e:
+            cls_name = reflection.get_class_name(cls, fully_qualified=False)
+            excp.raise_with_cause(excp.InvalidFormat,
+                                  "%s message response data not of the"
+                                  " expected format: %s" % (cls_name,
+                                                            e.message),
+                                  cause=e)
+        else:
+            state = data['state']
+            if state == FAILURE and 'result' in data:
+                ft.Failure.validate(data['result'])

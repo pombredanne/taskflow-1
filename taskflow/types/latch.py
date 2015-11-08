@@ -16,11 +16,16 @@
 
 import threading
 
-from taskflow.types import timing as tt
+from oslo_utils import timeutils
 
 
 class Latch(object):
-    """A class that ensures N-arrivals occur before unblocking."""
+    """A class that ensures N-arrivals occur before unblocking.
+
+    TODO(harlowja): replace with http://bugs.python.org/issue8777 when we no
+    longer have to support python 2.6 or 2.7 and we can only support 3.2 or
+    later.
+    """
 
     def __init__(self, count):
         count = int(count)
@@ -36,34 +41,26 @@ class Latch(object):
 
     def countdown(self):
         """Decrements the internal counter due to an arrival."""
-        self._cond.acquire()
-        try:
+        with self._cond:
             self._count -= 1
             if self._count <= 0:
                 self._cond.notify_all()
-        finally:
-            self._cond.release()
 
     def wait(self, timeout=None):
         """Waits until the latch is released.
 
-        NOTE(harlowja): if a timeout is provided this function will wait
-        until that timeout expires, if the latch has been released before the
-        timeout expires then this will return True, otherwise it will
-        return False.
+        :param timeout: wait until the timeout expires
+        :type timeout: number
+        :returns: true if the latch has been released before the
+                  timeout expires otherwise false
+        :rtype: boolean
         """
-        w = None
-        if timeout is not None:
-            w = tt.StopWatch(timeout).start()
-        self._cond.acquire()
-        try:
+        watch = timeutils.StopWatch(duration=timeout)
+        watch.start()
+        with self._cond:
             while self._count > 0:
-                if w is not None:
-                    if w.expired():
-                        return False
-                    else:
-                        timeout = w.leftover()
-                self._cond.wait(timeout)
+                if watch.expired():
+                    return False
+                else:
+                    self._cond.wait(watch.leftover(return_none=True))
             return True
-        finally:
-            self._cond.release()

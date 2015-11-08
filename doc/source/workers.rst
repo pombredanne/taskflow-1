@@ -1,21 +1,15 @@
--------
-Workers
--------
-
 Overview
 ========
 
 This is engine that schedules tasks to **workers** -- separate processes
 dedicated for certain atoms execution, possibly running on other machines,
-connected via `amqp`_ (or other supported `kombu
-<http://kombu.readthedocs.org/>`_ transports).
+connected via `amqp`_ (or other supported `kombu`_ transports).
 
 .. note::
 
-    This engine is under active development and is experimental but it is
-    usable and does work but is missing some features (please check the
-    `blueprint page`_ for known issues and plans) that will make it more
-    production ready.
+    This engine is under active development and is usable and **does** work
+    but is missing some features (please check the `blueprint page`_ for
+    known issues and plans) that will make it more production ready.
 
 .. _blueprint page: https://blueprints.launchpad.net/taskflow?searchtext=wbe
 
@@ -23,8 +17,8 @@ Terminology
 -----------
 
 Client
-  Code or program or service that uses this library to define flows and
-  run them via engines.
+  Code or program or service (or user) that uses this library to define
+  flows and run them via engines.
 
 Transport + protocol
   Mechanism (and `protocol`_ on top of that mechanism) used to pass information
@@ -36,11 +30,12 @@ Executor
   these requests can be accepted and processed by remote workers.
 
 Worker
-  Workers are started on remote hosts and has list of tasks it can perform (on
-  request). Workers accept and process task requests that are published by an
-  executor. Several requests can be processed simultaneously in separate
-  threads. For example, an `executor`_ can be passed to the worker and
-  configured to run in as many threads (green or not) as desired.
+  Workers are started on remote hosts and each has a list of tasks it can
+  perform (on request). Workers accept and process task requests that are
+  published by an executor. Several requests can be processed simultaneously
+  in separate threads (or processes...). For example, an `executor`_ can be
+  passed to the worker and configured to run in as many threads (green or
+  not) as desired.
 
 Proxy
   Executors interact with workers via a proxy. The proxy maintains the
@@ -72,41 +67,18 @@ Requirements
 .. _executor: https://docs.python.org/dev/library/concurrent.futures.html#executor-objects
 .. _protocol: http://en.wikipedia.org/wiki/Communications_protocol
 
-Use-cases
----------
-
-* `Glance`_
-
-  * Image tasks *(long-running)*
-
-    * Convert, import/export & more...
-
-* `Heat`_
-
-  * Engine work distribution
-
-* `Rally`_
-
-  * Load generation
-
-* *Your use-case here*
-
-.. _Heat: https://wiki.openstack.org/wiki/Heat
-.. _Rally: https://wiki.openstack.org/wiki/Rally
-.. _Glance: https://wiki.openstack.org/wiki/Glance
-
 Design
 ======
 
-There are two communication sides, the *executor* and *worker* that communicate
-using a proxy component. The proxy is designed to accept/publish messages
-from/into a named exchange.
+There are two communication sides, the *executor* (and associated engine
+derivative) and *worker* that communicate using a proxy component. The proxy
+is designed to accept/publish messages from/into a named exchange.
 
 High level architecture
 -----------------------
 
-.. image:: img/distributed_flow_rpc.png
-   :height: 275px
+.. image:: img/worker-engine.svg
+   :height: 340px
    :align: right
 
 Executor and worker communication
@@ -135,7 +107,7 @@ engine executor in the following manner:
       executes the task).
    2. If dispatched succeeded then the worker sends a confirmation response
       to the executor otherwise the worker sends a failed response along with
-      a serialized :py:class:`failure <taskflow.utils.misc.Failure>` object
+      a serialized :py:class:`failure <taskflow.types.failure.Failure>` object
       that contains what has failed (and why).
    3. The worker executes the task and once it is finished sends the result
       back to the originating executor (every time a task progress event is
@@ -145,27 +117,38 @@ engine executor in the following manner:
 4. The executor gets the task request confirmation from the worker and the task
    request state changes from the ``PENDING`` to the ``RUNNING`` state. Once a
    task request is in the ``RUNNING`` state it can't be timed-out (considering
-   that task execution process may take unpredictable time).
+   that the task execution process may take an unpredictable amount of time).
 5. The executor gets the task execution result from the worker and passes it
    back to the executor and worker-based engine to finish task processing (this
    repeats for subsequent tasks).
 
 .. note::
 
-    :py:class:`~taskflow.utils.misc.Failure` objects are not json-serializable
-    (they contain references to tracebacks which are not serializable), so they
-    are converted to dicts before sending and converted from dicts after
-    receiving on both executor & worker sides (this translation is lossy since
-    the traceback won't be fully retained).
+    :py:class:`~taskflow.types.failure.Failure` objects are not directly
+    json-serializable (they contain references to tracebacks which are not
+    serializable), so they are converted to dicts before sending and converted
+    from dicts after receiving on both executor & worker sides (this
+    translation is lossy since the traceback can't be fully retained, due
+    to its contents containing internal interpreter references and
+    details).
 
-Executor request format
-~~~~~~~~~~~~~~~~~~~~~~~
+Protocol
+~~~~~~~~
 
-* **task** - full task name to be performed
+.. automodule:: taskflow.engines.worker_based.protocol
+
+Examples
+~~~~~~~~
+
+Request (execute)
+"""""""""""""""""
+
+* **task_name** - full task name to be performed
+* **task_cls** - full task class name to be performed
 * **action** - task action to be performed (e.g. execute, revert)
 * **arguments** - arguments the task action to be called with
 * **result** - task execution result (result or
-  :py:class:`~taskflow.utils.misc.Failure`) *[passed to revert only]*
+  :py:class:`~taskflow.types.failure.Failure`) *[passed to revert only]*
 
 Additionally, the following parameters are added to the request message:
 
@@ -180,20 +163,70 @@ Additionally, the following parameters are added to the request message:
     {
         "action": "execute",
         "arguments": {
-            "joe_number": 444
+            "x": 111
         },
-        "task": "tasks.CallJoe"
+        "task_cls": "taskflow.tests.utils.TaskOneArgOneReturn",
+        "task_name": "taskflow.tests.utils.TaskOneArgOneReturn",
+        "task_version": [
+            1,
+            0
+        ]
     }
 
-Worker response format
-~~~~~~~~~~~~~~~~~~~~~~
+
+Request (revert)
+""""""""""""""""
+
+When **reverting:**
+
+.. code:: json
+
+    {
+        "action": "revert",
+        "arguments": {},
+        "failures": {
+            "taskflow.tests.utils.TaskWithFailure": {
+                "exc_type_names": [
+                    "RuntimeError",
+                    "StandardError",
+                    "Exception"
+                ],
+                "exception_str": "Woot!",
+                "traceback_str": "  File \"/homes/harlowja/dev/os/taskflow/taskflow/engines/action_engine/executor.py\", line 56, in _execute_task\n    result = task.execute(**arguments)\n  File \"/homes/harlowja/dev/os/taskflow/taskflow/tests/utils.py\", line 165, in execute\n    raise RuntimeError('Woot!')\n",
+                "version": 1
+            }
+        },
+        "result": [
+            "failure",
+            {
+                "exc_type_names": [
+                    "RuntimeError",
+                    "StandardError",
+                    "Exception"
+                ],
+                "exception_str": "Woot!",
+                "traceback_str": "  File \"/homes/harlowja/dev/os/taskflow/taskflow/engines/action_engine/executor.py\", line 56, in _execute_task\n    result = task.execute(**arguments)\n  File \"/homes/harlowja/dev/os/taskflow/taskflow/tests/utils.py\", line 165, in execute\n    raise RuntimeError('Woot!')\n",
+                "version": 1
+            }
+        ],
+        "task_cls": "taskflow.tests.utils.TaskWithFailure",
+        "task_name": "taskflow.tests.utils.TaskWithFailure",
+        "task_version": [
+            1,
+            0
+        ]
+    }
+
+Worker response(s)
+""""""""""""""""""
 
 When **running:**
 
 .. code:: json
 
     {
-        "status": "RUNNING"
+        "data": {},
+        "state": "RUNNING"
     }
 
 When **progressing:**
@@ -201,9 +234,11 @@ When **progressing:**
 .. code:: json
 
     {
-        "event_data": <event_data>,
-        "progress": <progress>,
-        "state": "PROGRESS"
+        "details": {
+            "progress": 0.5
+        },
+        "event_type": "update_progress",
+        "state": "EVENT"
     }
 
 When **succeeded:**
@@ -211,8 +246,9 @@ When **succeeded:**
 .. code:: json
 
     {
-        "event": <event>,
-        "result": <result>,
+        "data": {
+            "result": 666
+        },
         "state": "SUCCESS"
     }
 
@@ -221,14 +257,67 @@ When **failed:**
 .. code:: json
 
     {
-        "event": <event>,
-        "result": <misc.Failure>,
+        "data": {
+            "result": {
+                "exc_type_names": [
+                    "RuntimeError",
+                    "StandardError",
+                    "Exception"
+                ],
+                "exception_str": "Woot!",
+                "traceback_str": "  File \"/homes/harlowja/dev/os/taskflow/taskflow/engines/action_engine/executor.py\", line 56, in _execute_task\n    result = task.execute(**arguments)\n  File \"/homes/harlowja/dev/os/taskflow/taskflow/tests/utils.py\", line 165, in execute\n    raise RuntimeError('Woot!')\n",
+                "version": 1
+            }
+        },
         "state": "FAILURE"
     }
 
+Request state transitions
+-------------------------
+
+.. image:: img/wbe_request_states.svg
+   :width: 520px
+   :align: center
+   :alt: WBE request state transitions
+
+**WAITING** - Request placed on queue (or other `kombu`_ message bus/transport)
+but not *yet* consumed.
+
+**PENDING** - Worker accepted request and is pending to run using its
+executor (threads, processes, or other).
+
+**FAILURE** - Worker failed after running request (due to task exception) or
+no worker moved/started executing (by placing the request into ``RUNNING``
+state) with-in specified time span (this defaults to 60 seconds unless
+overridden).
+
+**RUNNING** - Workers executor (using threads, processes...) has started to
+run requested task (once this state is transitioned to any request timeout no
+longer becomes applicable; since at this point it is unknown how long a task
+will run since it can not be determined if a task is just taking a long time
+or has failed).
+
+**SUCCESS** - Worker finished running task without exception.
+
+.. note::
+
+    During the ``WAITING`` and ``PENDING`` stages the engine keeps track
+    of how long the request has been *alive* for and if a timeout is reached
+    the request will automatically transition to ``FAILURE`` and any further
+    transitions from a worker will be disallowed (for example, if a worker
+    accepts the request in the future and sets the task to ``PENDING`` this
+    transition will be logged and ignored). This timeout can be adjusted and/or
+    removed by setting the engine ``transition_timeout`` option to a
+    higher/lower value or by setting it to ``None`` (to remove the timeout
+    completely). In the future this will be improved to be more dynamic
+    by implementing the blueprints associated with `failover`_ and
+    `info/resilence`_.
+
+.. _failover: https://blueprints.launchpad.net/taskflow/+spec/wbe-worker-failover
+.. _info/resilence: https://blueprints.launchpad.net/taskflow/+spec/wbe-worker-info
+
 Usage
 =====
-
 
 Workers
 -------
@@ -273,32 +362,26 @@ For complete parameters and object usage please see
 
 .. code:: python
 
-    engine_conf = {
-        'engine': 'worker-based',
-        'url': 'amqp://guest:guest@localhost:5672//',
-        'exchange': 'test-exchange',
-        'topics': ['topic1', 'topic2'],
-    }
     flow = lf.Flow('simple-linear').add(...)
-    eng = taskflow.engines.load(flow, engine_conf=engine_conf)
+    eng = taskflow.engines.load(flow, engine='worker-based',
+                                url='amqp://guest:guest@localhost:5672//',
+                                exchange='test-exchange',
+                                topics=['topic1', 'topic2'])
     eng.run()
 
 **Example with filesystem transport:**
 
 .. code:: python
 
-    engine_conf = {
-        'engine': 'worker-based',
-        'exchange': 'test-exchange',
-        'topics': ['topic1', 'topic2'],
-        'transport': 'filesystem',
-        'transport_options': {
-            'data_folder_in': '/tmp/test',
-            'data_folder_out': '/tmp/test',
-        },
-    }
     flow = lf.Flow('simple-linear').add(...)
-    eng = taskflow.engines.load(flow, engine_conf=engine_conf)
+    eng = taskflow.engines.load(flow, engine='worker-based',
+                                exchange='test-exchange',
+                                topics=['topic1', 'topic2'],
+                                transport='filesystem',
+                                transport_options={
+                                    'data_folder_in': '/tmp/in',
+                                    'data_folder_out': '/tmp/out',
+                                })
     eng.run()
 
 Additional supported keyword arguments:
@@ -324,16 +407,21 @@ Limitations
   locally to avoid transport overhead for very simple tasks (currently it will
   run even lightweight tasks remotely, which may be non-performant).
 * Fault detection, currently when a worker acknowledges a task the engine will
-  wait for the task result indefinitely (a task could take a very long time to
-  finish). In the future there needs to be a way to limit the duration of a
-  remote workers execution (and track there liveness) and possibly spawn
-  the task on a secondary worker if a timeout is reached (aka the first worker
-  has died or has stopped responding).
+  wait for the task result indefinitely (a task may take an indeterminate
+  amount of time to finish). In the future there needs to be a way to limit
+  the duration of a remote workers execution (and track their liveness) and
+  possibly spawn the task on a secondary worker if a timeout is reached (aka
+  the first worker has died or has stopped responding).
 
-Interfaces
-==========
+Implementations
+===============
 
-.. automodule:: taskflow.engines.worker_based.worker
 .. automodule:: taskflow.engines.worker_based.engine
+
+Components
+----------
+
 .. automodule:: taskflow.engines.worker_based.proxy
-.. automodule:: taskflow.engines.worker_based.executor
+.. automodule:: taskflow.engines.worker_based.worker
+
+.. _kombu: http://kombu.readthedocs.org/

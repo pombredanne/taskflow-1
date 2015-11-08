@@ -40,10 +40,12 @@ REVERTING = REVERTING
 SUCCESS = SUCCESS
 RUNNING = RUNNING
 RETRYING = 'RETRYING'
+IGNORE = 'IGNORE'
+REVERT_FAILURE = 'REVERT_FAILURE'
 
 # Atom intentions.
 EXECUTE = 'EXECUTE'
-IGNORE = 'IGNORE'
+IGNORE = IGNORE
 REVERT = 'REVERT'
 RETRY = 'RETRY'
 INTENTIONS = (EXECUTE, IGNORE, REVERT, RETRY)
@@ -53,8 +55,39 @@ SCHEDULING = 'SCHEDULING'
 WAITING = 'WAITING'
 ANALYZING = 'ANALYZING'
 
-# Flow state transitions
+# Job state transitions
 # See: http://docs.openstack.org/developer/taskflow/states.html
+
+_ALLOWED_JOB_TRANSITIONS = frozenset((
+    # Job is being claimed.
+    (UNCLAIMED, CLAIMED),
+
+    # Job has been lost (or manually unclaimed/abandoned).
+    (CLAIMED, UNCLAIMED),
+
+    # Job has been finished.
+    (CLAIMED, COMPLETE),
+))
+
+
+def check_job_transition(old_state, new_state):
+    """Check that job can transition from from ``old_state`` to ``new_state``.
+
+    If transition can be performed, it returns true. If transition
+    should be ignored, it returns false. If transition is not
+    valid, it raises an InvalidState exception.
+    """
+    if old_state == new_state:
+        return False
+    pair = (old_state, new_state)
+    if pair in _ALLOWED_JOB_TRANSITIONS:
+        return True
+    raise exc.InvalidState("Job transition from '%s' to '%s' is not allowed"
+                           % pair)
+
+
+# Flow state transitions
+# See: http://docs.openstack.org/developer/taskflow/states.html#flow
 
 _ALLOWED_FLOW_TRANSITIONS = frozenset((
     (PENDING, RUNNING),       # run it!
@@ -70,6 +103,7 @@ _ALLOWED_FLOW_TRANSITIONS = frozenset((
     (FAILURE, RUNNING),       # see note below
 
     (REVERTED, PENDING),      # try again
+    (SUCCESS, PENDING),       # run it again
 
     (SUSPENDING, SUSPENDED),  # suspend finished
     (SUSPENDING, SUCCESS),    # all tasks finished while we were waiting
@@ -107,10 +141,10 @@ _IGNORED_FLOW_TRANSITIONS = frozenset(
 
 
 def check_flow_transition(old_state, new_state):
-    """Check that flow can transition from old_state to new_state.
+    """Check that flow can transition from ``old_state`` to ``new_state``.
 
-    If transition can be performed, it returns True. If transition
-    should be ignored, it returns False. If transition is not
+    If transition can be performed, it returns true. If transition
+    should be ignored, it returns false. If transition is not
     valid, it raises an InvalidState exception.
     """
     if old_state == new_state:
@@ -120,38 +154,59 @@ def check_flow_transition(old_state, new_state):
         return True
     if pair in _IGNORED_FLOW_TRANSITIONS:
         return False
-    raise exc.InvalidState("Flow transition from %s to %s is not allowed"
+    raise exc.InvalidState("Flow transition from '%s' to '%s' is not allowed"
                            % pair)
 
 
 # Task state transitions
-# See: http://docs.openstack.org/developer/taskflow/states.html
+# See: http://docs.openstack.org/developer/taskflow/states.html#task
 
 _ALLOWED_TASK_TRANSITIONS = frozenset((
     (PENDING, RUNNING),       # run it!
+    (PENDING, IGNORE),        # skip it!
 
-    (RUNNING, SUCCESS),       # the task finished successfully
-    (RUNNING, FAILURE),       # the task failed
+    (RUNNING, SUCCESS),       # the task executed successfully
+    (RUNNING, FAILURE),       # the task execution failed
 
-    (FAILURE, REVERTING),     # task failed, do cleanup now
-    (SUCCESS, REVERTING),     # some other task failed, do cleanup now
+    (FAILURE, REVERTING),     # task execution failed, try reverting...
+    (SUCCESS, REVERTING),     # some other task failed, try reverting...
 
-    (REVERTING, REVERTED),    # revert done
-    (REVERTING, FAILURE),     # revert failed
+    (REVERTING, REVERTED),           # the task reverted successfully
+    (REVERTING, REVERT_FAILURE),     # the task failed reverting (terminal!)
 
     (REVERTED, PENDING),      # try again
-
-    (SUCCESS, RETRYING),      # retrying retry controller
-    (RETRYING, RUNNING),      # run retry controller that has been retrying
+    (IGNORE, PENDING),        # try again
 ))
 
 
 def check_task_transition(old_state, new_state):
-    """Check that task can transition from old_state to new_state.
+    """Check that task can transition from ``old_state`` to ``new_state``.
 
-    If transition can be performed, it returns True, False otherwise.
+    If transition can be performed, it returns true, false otherwise.
     """
     pair = (old_state, new_state)
     if pair in _ALLOWED_TASK_TRANSITIONS:
+        return True
+    return False
+
+
+# Retry state transitions
+# See: http://docs.openstack.org/developer/taskflow/states.html#retry
+
+_ALLOWED_RETRY_TRANSITIONS = list(_ALLOWED_TASK_TRANSITIONS)
+_ALLOWED_RETRY_TRANSITIONS.extend([
+    (SUCCESS, RETRYING),      # retrying retry controller
+    (RETRYING, RUNNING),      # run retry controller that has been retrying
+])
+_ALLOWED_RETRY_TRANSITIONS = frozenset(_ALLOWED_RETRY_TRANSITIONS)
+
+
+def check_retry_transition(old_state, new_state):
+    """Check that retry can transition from ``old_state`` to ``new_state``.
+
+    If transition can be performed, it returns true, false otherwise.
+    """
+    pair = (old_state, new_state)
+    if pair in _ALLOWED_RETRY_TRANSITIONS:
         return True
     return False

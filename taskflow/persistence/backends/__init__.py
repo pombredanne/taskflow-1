@@ -15,11 +15,12 @@
 #    under the License.
 
 import contextlib
-import logging
 
+import six
 from stevedore import driver
 
 from taskflow import exceptions as exc
+from taskflow import logging
 from taskflow.utils import misc
 
 
@@ -38,26 +39,33 @@ def fetch(conf, namespace=BACKEND_NAMESPACE, **kwargs):
 
     NOTE(harlowja): to aid in making it easy to specify configuration and
     options to a backend the configuration (which is typical just a dictionary)
-    can also be a uri string that identifies the entrypoint name and any
+    can also be a URI string that identifies the entrypoint name and any
     configuration specific to that backend.
 
-    For example, given the following configuration uri:
+    For example, given the following configuration URI::
 
-    mysql://<not-used>/?a=b&c=d
+        mysql://<not-used>/?a=b&c=d
 
     This will look for the entrypoint named 'mysql' and will provide
-    a configuration object composed of the uris parameters, in this case that
-    is {'a': 'b', 'c': 'd'} to the constructor of that persistence backend
+    a configuration object composed of the URI's components, in this case that
+    is ``{'a': 'b', 'c': 'd'}`` to the constructor of that persistence backend
     instance.
     """
+    if isinstance(conf, six.string_types):
+        conf = {'connection': conf}
     backend_name = conf['connection']
     try:
-        pieces = misc.parse_uri(backend_name)
+        uri = misc.parse_uri(backend_name)
     except (TypeError, ValueError):
         pass
     else:
-        backend_name = pieces['scheme']
-        conf = misc.merge_uri(pieces, conf.copy())
+        backend_name = uri.scheme
+        conf = misc.merge_uri(uri, conf.copy())
+    # If the backend is like 'mysql+pymysql://...' which informs the
+    # backend to use a dialect (supported by sqlalchemy at least) we just want
+    # to look at the first component to find our entrypoint backend name...
+    if backend_name.find("+") != -1:
+        backend_name = backend_name.split("+", 1)[0]
     LOG.debug('Looking for %r backend driver in %r', backend_name, namespace)
     try:
         mgr = driver.DriverManager(namespace, backend_name,

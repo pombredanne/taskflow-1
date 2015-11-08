@@ -17,40 +17,70 @@
 
 import abc
 
+from debtcollector import moves
 import six
 
-from taskflow.utils import misc
+from taskflow.types import notifier
 
 
 @six.add_metaclass(abc.ABCMeta)
-class EngineBase(object):
+class Engine(object):
     """Base for all engines implementations.
 
     :ivar notifier: A notification object that will dispatch events that
                     occur related to the flow the engine contains.
     :ivar task_notifier: A notification object that will dispatch events that
                          occur related to the tasks the engine contains.
+                         occur related to the tasks the engine
+                         contains (deprecated).
+    :ivar atom_notifier: A notification object that will dispatch events that
+                         occur related to the atoms the engine contains.
     """
 
-    def __init__(self, flow, flow_detail, backend, conf):
+    def __init__(self, flow, flow_detail, backend, options):
         self._flow = flow
         self._flow_detail = flow_detail
         self._backend = backend
-        if not conf:
-            self._conf = {}
+        if not options:
+            self._options = {}
         else:
-            self._conf = dict(conf)
-        self.notifier = misc.Notifier()
-        self.task_notifier = misc.Notifier()
+            self._options = dict(options)
+        self._notifier = notifier.Notifier()
+        self._atom_notifier = notifier.Notifier()
 
-    @misc.cachedproperty
-    def storage(self):
-        """The storage unit for this flow."""
-        return self._storage_factory(self._flow_detail, self._backend)
+    @property
+    def notifier(self):
+        """The flow notifier."""
+        return self._notifier
+
+    @property
+    @moves.moved_property('atom_notifier', version="0.6",
+                          removal_version="2.0")
+    def task_notifier(self):
+        """The task notifier.
+
+        .. deprecated:: 0.6
+
+            The property is **deprecated** and is present for
+            backward compatibility **only**. In order to access this
+            property going forward the :py:attr:`.atom_notifier` should
+            be used instead.
+        """
+        return self._atom_notifier
+
+    @property
+    def atom_notifier(self):
+        """The atom notifier."""
+        return self._atom_notifier
+
+    @property
+    def options(self):
+        """The options that were passed to this engine on construction."""
+        return self._options
 
     @abc.abstractproperty
-    def _storage_factory(self):
-        """Storage factory that will be used to generate storage objects."""
+    def storage(self):
+        """The storage unit for this engine."""
 
     @abc.abstractmethod
     def compile(self):
@@ -63,13 +93,35 @@ class EngineBase(object):
         """
 
     @abc.abstractmethod
+    def reset(self):
+        """Reset back to the ``PENDING`` state.
+
+        If a flow had previously ended up (from a prior engine
+        :py:func:`.run`) in the ``FAILURE``, ``SUCCESS`` or ``REVERTED``
+        states (or for some reason it ended up in an intermediary state) it
+        can be desireable to make it possible to run it again. Calling this
+        method enables that to occur (without causing a state transition
+        failure, which would typically occur if :py:meth:`.run` is called
+        directly without doing a reset).
+        """
+
+    @abc.abstractmethod
     def prepare(self):
         """Performs any pre-run, but post-compilation actions.
 
         NOTE(harlowja): During preparation it is currently assumed that the
-        underlying storage will be initialized, all final dependencies
-        will be verified, the tasks will be reset and the engine will enter
-        the PENDING state.
+        underlying storage will be initialized, the atoms will be reset and
+        the engine will enter the ``PENDING`` state.
+        """
+
+    @abc.abstractmethod
+    def validate(self):
+        """Performs any pre-run, post-prepare validation actions.
+
+        NOTE(harlowja): During validation all final dependencies
+        will be verified and ensured. This will by default check that all
+        atoms have satisfiable requirements (satisfied by some other
+        provider).
         """
 
     @abc.abstractmethod
@@ -80,8 +132,13 @@ class EngineBase(object):
     def suspend(self):
         """Attempts to suspend the engine.
 
-        If the engine is currently running tasks then this will attempt to
-        suspend future work from being started (currently active tasks can
+        If the engine is currently running atoms then this will attempt to
+        suspend future work from being started (currently active atoms can
         not currently be preempted) and move the engine into a suspend state
         which can then later be resumed from.
         """
+
+
+# TODO(harlowja): remove in 0.7 or later...
+EngineBase = moves.moved_class(Engine, 'EngineBase', __name__,
+                               version="0.6", removal_version="2.0")

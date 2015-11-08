@@ -14,12 +14,59 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import collections
+import os
+
 import networkx as nx
 import six
 
 
+def _common_format(g, edge_notation):
+    lines = []
+    lines.append("Name: %s" % g.name)
+    lines.append("Type: %s" % type(g).__name__)
+    lines.append("Frozen: %s" % nx.is_frozen(g))
+    lines.append("Density: %0.3f" % nx.density(g))
+    lines.append("Nodes: %s" % g.number_of_nodes())
+    for n, n_data in g.nodes_iter(data=True):
+        if n_data:
+            lines.append("  - %s (%s)" % (n, n_data))
+        else:
+            lines.append("  - %s" % n)
+    lines.append("Edges: %s" % g.number_of_edges())
+    for (u, v, e_data) in g.edges_iter(data=True):
+        if e_data:
+            lines.append("  %s %s %s (%s)" % (u, edge_notation, v, e_data))
+        else:
+            lines.append("  %s %s %s" % (u, edge_notation, v))
+    return lines
+
+
+class Graph(nx.Graph):
+    """A graph subclass with useful utility functions."""
+
+    def __init__(self, data=None, name=''):
+        super(Graph, self).__init__(name=name, data=data)
+        self.frozen = False
+
+    def freeze(self):
+        """Freezes the graph so that no more mutations can occur."""
+        if not self.frozen:
+            nx.freeze(self)
+        return self
+
+    def export_to_dot(self):
+        """Exports the graph to a dot format (requires pydot library)."""
+        return nx.to_pydot(self).to_string()
+
+    def pformat(self):
+        """Pretty formats your graph into a string."""
+        return os.linesep.join(_common_format(self, "<->"))
+
+
 class DiGraph(nx.DiGraph):
     """A directed graph subclass with useful utility functions."""
+
     def __init__(self, data=None, name=''):
         super(DiGraph, self).__init__(name=name, data=data)
         self.frozen = False
@@ -53,20 +100,7 @@ class DiGraph(nx.DiGraph):
         details about your graph, including; name, type, frozeness, node count,
         nodes, edge count, edges, graph density and graph cycles (if any).
         """
-        lines = []
-        lines.append("Name: %s" % self.name)
-        lines.append("Type: %s" % type(self).__name__)
-        lines.append("Frozen: %s" % nx.is_frozen(self))
-        lines.append("Nodes: %s" % self.number_of_nodes())
-        for n in self.nodes_iter():
-            lines.append("  - %s" % n)
-        lines.append("Edges: %s" % self.number_of_edges())
-        for (u, v, e_data) in self.edges_iter(data=True):
-            if e_data:
-                lines.append("  %s -> %s (%s)" % (u, v, e_data))
-            else:
-                lines.append("  %s -> %s" % (u, v))
-        lines.append("Density: %0.3f" % nx.density(self))
+        lines = _common_format(self, "->")
         cycles = list(nx.cycles.recursive_simple_cycles(self))
         lines.append("Cycles: %s" % len(cycles))
         for cycle in cycles:
@@ -76,7 +110,7 @@ class DiGraph(nx.DiGraph):
                 buf.write(" --> %s" % (cycle[i]))
             buf.write(" --> %s" % (cycle[0]))
             lines.append("  %s" % buf.getvalue())
-        return "\n".join(lines)
+        return os.linesep.join(lines)
 
     def export_to_dot(self):
         """Exports the graph to a dot format (requires pydot library)."""
@@ -98,27 +132,68 @@ class DiGraph(nx.DiGraph):
             if not len(self.predecessors(n)):
                 yield n
 
+    def bfs_predecessors_iter(self, n):
+        """Iterates breadth first over *all* predecessors of a given node.
 
-def merge_graphs(graphs, allow_overlaps=False):
-    """Merges a bunch of graphs into a single graph."""
-    if not graphs:
-        return None
-    graph = graphs[0]
-    for g in graphs[1:]:
+        This will go through the nodes predecessors, then the predecessor nodes
+        predecessors and so on until no more predecessors are found.
+
+        NOTE(harlowja): predecessor cycles (if they exist) will not be iterated
+        over more than once (this prevents infinite iteration).
+        """
+        visited = set([n])
+        queue = collections.deque(self.predecessors_iter(n))
+        while queue:
+            pred = queue.popleft()
+            if pred not in visited:
+                yield pred
+                visited.add(pred)
+                for pred_pred in self.predecessors_iter(pred):
+                    if pred_pred not in visited:
+                        queue.append(pred_pred)
+
+
+class OrderedDiGraph(DiGraph):
+    """A directed graph subclass with useful utility functions.
+
+    This derivative retains node, edge, insertation and iteration
+    ordering (so that the iteration order matches the insertation
+    order).
+    """
+    node_dict_factory = collections.OrderedDict
+    adjlist_dict_factory = collections.OrderedDict
+    edge_attr_dict_factory = collections.OrderedDict
+
+
+def merge_graphs(graph, *graphs, **kwargs):
+    """Merges a bunch of graphs into a new graph.
+
+    If no additional graphs are provided the first graph is
+    returned unmodified otherwise the merged graph is returned.
+    """
+    tmp_graph = graph
+    allow_overlaps = kwargs.get('allow_overlaps', False)
+    overlap_detector = kwargs.get('overlap_detector')
+    if overlap_detector is not None and not six.callable(overlap_detector):
+        raise ValueError("Overlap detection callback expected to be callable")
+    elif overlap_detector is None:
+        overlap_detector = (lambda to_graph, from_graph:
+                            len(to_graph.subgraph(from_graph.nodes_iter())))
+    for g in graphs:
         # This should ensure that the nodes to be merged do not already exist
         # in the graph that is to be merged into. This could be problematic if
         # there are duplicates.
         if not allow_overlaps:
             # Attempt to induce a subgraph using the to be merged graphs nodes
             # and see if any graph results.
-            overlaps = graph.subgraph(g.nodes_iter())
-            if len(overlaps):
+            overlaps = overlap_detector(graph, g)
+            if overlaps:
                 raise ValueError("Can not merge graph %s into %s since there "
                                  "are %s overlapping nodes (and we do not "
                                  "support merging nodes)" % (g, graph,
-                                                             len(overlaps)))
-        # Keep the target graphs name.
-        name = graph.name
+                                                             overlaps))
         graph = nx.algorithms.compose(graph, g)
-        graph.name = name
+    # Keep the first graphs name.
+    if graphs:
+        graph.name = tmp_graph.name
     return graph

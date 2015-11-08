@@ -33,7 +33,9 @@ from taskflow import exceptions
 from taskflow.patterns import unordered_flow as uf
 from taskflow import task
 from taskflow.tests import utils
-from taskflow.utils import misc
+from taskflow.types import failure
+
+import example_utils as eu  # noqa
 
 # INTRO: In this example we create two tasks which can trigger exceptions
 # based on various inputs to show how to analyze the thrown exceptions for
@@ -51,12 +53,6 @@ from taskflow.utils import misc
 # exceptions being thrown, but at the end of that rollback the engine will
 # rethrow these exceptions to the code that called the run() method; allowing
 # that code to do further cleanups (if desired).
-
-
-def print_wrapped(text):
-    print("-" * (len(text)))
-    print(text)
-    print("-" * (len(text)))
 
 
 class FirstException(Exception):
@@ -97,32 +93,32 @@ def run(**store):
     try:
         with utils.wrap_all_failures():
             taskflow.engines.run(flow, store=store,
-                                 engine_conf='parallel')
+                                 engine='parallel')
     except exceptions.WrappedFailure as ex:
         unknown_failures = []
-        for failure in ex:
-            if failure.check(FirstException):
-                print("Got FirstException: %s" % failure.exception_str)
-            elif failure.check(SecondException):
-                print("Got SecondException: %s" % failure.exception_str)
+        for a_failure in ex:
+            if a_failure.check(FirstException):
+                print("Got FirstException: %s" % a_failure.exception_str)
+            elif a_failure.check(SecondException):
+                print("Got SecondException: %s" % a_failure.exception_str)
             else:
-                print("Unknown failure: %s" % failure)
-                unknown_failures.append(failure)
-        misc.Failure.reraise_if_any(unknown_failures)
+                print("Unknown failure: %s" % a_failure)
+                unknown_failures.append(a_failure)
+        failure.Failure.reraise_if_any(unknown_failures)
 
 
-print_wrapped("Raise and catch first exception only")
+eu.print_wrapped("Raise and catch first exception only")
 run(sleep1=0.0, raise1=True,
     sleep2=0.0, raise2=False)
 
 # NOTE(imelnikov): in general, sleeping does not guarantee that we'll have both
 # task running before one of them fails, but with current implementation this
 # works most of times, which is enough for our purposes here (as an example).
-print_wrapped("Raise and catch both exceptions")
+eu.print_wrapped("Raise and catch both exceptions")
 run(sleep1=1.0, raise1=True,
     sleep2=1.0, raise2=True)
 
-print_wrapped("Handle one exception, and re-raise another")
+eu.print_wrapped("Handle one exception, and re-raise another")
 try:
     run(sleep1=1.0, raise1=True,
         sleep2=1.0, raise2='boom')

@@ -27,16 +27,14 @@ top_dir = os.path.abspath(os.path.join(os.path.dirname(__file__),
 sys.path.insert(0, top_dir)
 sys.path.insert(0, self_dir)
 
-from taskflow.engines.action_engine import engine
+from taskflow import engines
 from taskflow.patterns import linear_flow as lf
-from taskflow.persistence.backends import impl_memory
 from taskflow import task
-from taskflow.utils import persistence_utils
 
-# INTRO: This examples shows how to run a engine using the engine iteration
+# INTRO: These examples show how to run an engine using the engine iteration
 # capability, in between iterations other activities occur (in this case a
 # value is output to stdout); but more complicated actions can occur at the
-# boundary when a engine yields its current state back to the caller.
+# boundary when an engine yields its current state back to the caller.
 
 
 class EchoNameTask(task.Task):
@@ -48,10 +46,7 @@ f = lf.Flow("counter")
 for i in range(0, 10):
     f.add(EchoNameTask("echo_%s" % (i + 1)))
 
-be = impl_memory.MemoryBackend()
-book = persistence_utils.temporary_log_book(be)
-fd = persistence_utils.create_flow_detail(f, book, be)
-e = engine.SingleThreadedActionEngine(f, fd, be, {})
+e = engines.load(f)
 e.compile()
 e.prepare()
 

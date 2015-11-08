@@ -16,9 +16,24 @@
 
 import abc
 
+from oslo_utils import reflection
 import six
 
-from taskflow.utils import reflection
+# Link metadata keys that have inherent/special meaning.
+#
+# This key denotes the link is an invariant that ensures the order is
+# correctly preserved.
+LINK_INVARIANT = 'invariant'
+# This key denotes the link is a manually/user-specified.
+LINK_MANUAL = 'manual'
+# This key denotes the link was created when resolving/compiling retries.
+LINK_RETRY = 'retry'
+# This key denotes the link was created due to symbol constraints and the
+# value will be a set of names that the constraint ensures are satisfied.
+LINK_REASONS = 'reasons'
+#
+# This key denotes a callable that will determine if the target is visited.
+LINK_DECIDER = 'decider'
 
 
 @six.add_metaclass(abc.ABCMeta)
@@ -34,10 +49,7 @@ class Flow(object):
 
     NOTE(harlowja): if a flow is placed in another flow as a subflow, a desired
     way to compose flows together, then it is valid and permissible that during
-    execution the subflow & parent flow may be flattened into a new flow. Since
-    a flow is just a 'structuring' concept this is typically a behavior that
-    should not be worried about (as it is not visible to the user), but it is
-    worth mentioning here.
+    compilation the subflow & parent flow *may* be flattened into a new flow.
     """
 
     def __init__(self, name, retry=None):
@@ -45,7 +57,7 @@ class Flow(object):
         self._retry = retry
         # NOTE(akarpinska): if retry doesn't have a name,
         # the name of its owner will be assigned
-        if self._retry and self._retry.name is None:
+        if self._retry is not None and self._retry.name is None:
             self._retry.name = self.name + "_retry"
 
     @property
@@ -86,34 +98,29 @@ class Flow(object):
             * ``meta`` is link metadata, a dictionary.
         """
 
+    @abc.abstractmethod
+    def iter_nodes(self):
+        """Iterate over nodes of the flow.
+
+        Iterates over 2-tuples ``(A, meta)``, where
+            * ``A`` is a child (atom or subflow) of current flow;
+            * ``meta`` is link metadata, a dictionary.
+        """
+
     def __str__(self):
-        lines = ["%s: %s" % (reflection.get_class_name(self), self.name)]
-        lines.append("%s" % (len(self)))
-        return "; ".join(lines)
+        return "%s: %s(len=%d)" % (reflection.get_class_name(self),
+                                   self.name, len(self))
 
     @property
     def provides(self):
-        """Set of result names provided by the flow.
-
-        Includes names of all the outputs provided by atoms of this flow.
-        """
+        """Set of symbol names provided by the flow."""
         provides = set()
-        if self._retry:
+        if self._retry is not None:
             provides.update(self._retry.provides)
-        for subflow in self:
-            provides.update(subflow.provides)
-        return provides
+        for item in self:
+            provides.update(item.provides)
+        return frozenset(provides)
 
-    @property
+    @abc.abstractproperty
     def requires(self):
-        """Set of argument names required by the flow.
-
-        Includes names of all the inputs required by atoms of this
-        flow, but not provided within the flow itself.
-        """
-        requires = set()
-        if self._retry:
-            requires.update(self._retry.requires)
-        for subflow in self:
-            requires.update(subflow.requires)
-        return requires - self.provides
+        """Set of *unsatisfied* symbol names required by the flow."""
